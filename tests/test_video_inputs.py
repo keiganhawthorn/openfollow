@@ -12,39 +12,13 @@ from openfollow.runtime.receiver_bus import ReceiverBusHandler
 from openfollow.runtime.receiver_pipeline import ReceiverPipelineAssembler
 from openfollow.runtime.receiver_state import ReceiverStateMachine
 from openfollow.video.inputs import get_registry
-from openfollow.video.inputs._base import ReconnectPolicy, redact_uri
+from openfollow.video.inputs._base import ReconnectPolicy
 from openfollow.video.inputs.ndi import NdiInput
 from openfollow.video.inputs.rtp import _parse_rtp_url
 from openfollow.video.inputs.rtsp import RtspInput
 from openfollow.video.inputs.srt import SrtInput, _resolve_srt_uri
 
 pytestmark = pytest.mark.unit
-
-
-def test_redact_uri_strips_inline_credentials() -> None:
-    assert redact_uri("rtsp://user:pass@cam.local:554/h264") == "rtsp://cam.local:554/h264"
-
-
-def test_redact_uri_masks_srt_query_secrets_keeps_host() -> None:
-    out = redact_uri("srt://host:5000?streamid=r=0&passphrase=secret&latency=20")
-    assert "secret" not in out
-    assert "r=0" not in out
-    assert "host:5000" in out
-    assert "latency=20" in out
-
-
-def test_redact_uri_passes_through_credential_free_and_schemeless() -> None:
-    assert redact_uri("rtsp://cam:554/stream") == "rtsp://cam:554/stream"  # no creds
-    assert redact_uri("not-a-uri") == "not-a-uri"  # no scheme
-    assert redact_uri("file:///x") == "file:///x"  # no netloc
-    assert redact_uri("host:554/path") == "host:554/path"  # bare host:port, no userinfo
-
-
-def test_redact_uri_strips_credentials_from_schemeless_shorthand() -> None:
-    # urlsplit reads the userinfo as a bogus scheme + empty netloc; a plain
-    # pass-through would have logged/displayed the password verbatim.
-    assert redact_uri("user:pass@192.168.0.1/stream") == "192.168.0.1/stream"
-    assert redact_uri("admin:hunter2@cam.local:554") == "cam.local:554"
 
 
 def test_get_source_label_redacts_rtsp_credentials() -> None:
@@ -203,6 +177,43 @@ def test_receiver_state_machine_marks_video_flow_without_placeholder_connect() -
     assert state.mark_frame_received() is False
     assert state.connected is False
     assert state.video_flow_detected is False
+
+
+def test_receiver_state_machine_refuses_placeholder_caps() -> None:
+    """The placeholder's own geometry is not the source's.
+
+    Both probes live on the shared sink and outlive every pipeline rebuild, so
+    the "No Signal" caps reach the same writer the real source uses. Publishing
+    them reports a feed that has never delivered a frame as 1080p @ 30.
+    """
+    state = ReceiverStateMachine(reconnect_delay=1.0)
+    state.set_placeholder_pipeline(True)
+
+    assert state.set_resolution(1920, 1080) is False
+    state.set_source_framerate(30.0)
+    assert state.resolution == (0, 0)
+    assert state.source_framerate == 0.0
+
+    # Not a latch: the real pipeline replacing it publishes normally.
+    state.set_placeholder_pipeline(False)
+    assert state.set_resolution(1024, 768) is True
+    state.set_source_framerate(25.0)
+    assert state.resolution == (1024, 768)
+    assert state.source_framerate == 25.0
+
+
+def test_receiver_state_machine_clear_source_caps_drops_a_prior_source() -> None:
+    """Falling back to the placeholder must not leave the previous source's
+    figures standing, or the panel reports a resolution and rate for a feed
+    that has stopped delivering frames."""
+    state = ReceiverStateMachine(reconnect_delay=1.0)
+    state.set_resolution(1280, 720)
+    state.set_source_framerate(50.0)
+
+    state.clear_source_caps()
+
+    assert state.resolution == (0, 0)
+    assert state.source_framerate == 0.0
 
 
 def test_receiver_bus_handler_dispatches_core_message_types() -> None:

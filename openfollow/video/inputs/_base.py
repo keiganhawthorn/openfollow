@@ -5,7 +5,8 @@
 ``VideoInputBase`` is the ABC each protocol plugin subclasses; the dataclasses
 (``ConfigField``, ``WebRoute``, ``ReconnectPolicy``, ``InputCapabilities``)
 declare its config fields, routes, reconnection behaviour, and feature flags.
-Also provides shared helpers for URI redaction and positive-int coercion.
+Also provides a shared helper for positive-int coercion; URI credential
+handling lives in :mod:`openfollow.uri_redaction`.
 """
 
 from __future__ import annotations
@@ -16,11 +17,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
-
-_REDACTED_QUERY_KEYS = frozenset({"passphrase", "streamid"})
 
 
 def coerce_positive_int(value: Any, default: int) -> int:
@@ -39,34 +37,6 @@ def coerce_positive_int(value: Any, default: int) -> int:
     return n if n >= 1 else default
 
 
-def redact_uri(uri: str) -> str:
-    """Strip inline credentials from a media URI so it is safe to log/display.
-
-    ``rtsp://user:pass@host:554/s`` → ``rtsp://host:554/s``; SRT
-    ``?passphrase=..`` / ``?streamid=..`` values are masked. A schemeless
-    ``user:pass@host/s`` (common RTSP shorthand) still has its userinfo
-    stripped – ``urlsplit`` parses the userinfo as a bogus scheme with an
-    empty netloc, so a plain pass-through would leak the password.
-    """
-    try:
-        parts = urlsplit(uri)
-    except ValueError:  # pragma: no cover - defensive; urlsplit rarely raises
-        return uri
-    if not parts.netloc:
-        # No authority parsed (no ``//``): credentials, if any, live before the
-        # first ``/`` of the path. Strip the userinfo prefix when present.
-        prefix, slash, rest = uri.partition("/")
-        if "@" in prefix:
-            return prefix.rsplit("@", 1)[-1] + slash + rest
-        return uri
-    netloc = parts.netloc.rsplit("@", 1)[-1] if "@" in parts.netloc else parts.netloc
-    query = parts.query
-    if query:
-        pairs = parse_qsl(query, keep_blank_values=True)
-        query = urlencode([(k, "***" if k.lower() in _REDACTED_QUERY_KEYS else v) for k, v in pairs])
-    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
-
-
 @dataclass
 class ConfigField:
     """A config field that this input needs stored in config.toml."""
@@ -77,6 +47,10 @@ class ConfigField:
     label: str  # human-readable label for web UI
     choices: tuple[tuple[str, str], ...] = field(default_factory=tuple)  # enum-style choices for list picker
     device_editable: bool = True  # False = web-only field; the on-device URL editor / list picker skip it
+    # False = keep edge whitespace on save. Credentials only: it can be part of
+    # the secret and is invisible in a password field, so trimming one fails
+    # authentication with nothing on screen to explain why.
+    strip: bool = True
 
 
 @dataclass
@@ -257,7 +231,11 @@ class VideoInputBase(ABC):
             if f.name in form_data:
                 val = form_data[f.name]
                 if f.type is str:
-                    setattr(cfg, f.name, str(val).strip() if val is not None else f.default)
+                    if val is None:
+                        setattr(cfg, f.name, f.default)
+                    else:
+                        text = str(val)
+                        setattr(cfg, f.name, text.strip() if f.strip else text)
                 elif f.type is int:
                     # ``OverflowError`` too: a crafted POST of ``1e400`` decodes
                     # to ``float('inf')`` and ``int(inf)`` raises it (not

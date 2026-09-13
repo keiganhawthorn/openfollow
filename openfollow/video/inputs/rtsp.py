@@ -8,12 +8,12 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from openfollow.uri_redaction import redact_uri, strip_uri_userinfo
 from openfollow.video.inputs._base import (
     ConfigField,
     InputCapabilities,
     ReconnectPolicy,
     VideoInputBase,
-    redact_uri,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,11 @@ class RtspInput(VideoInputBase):
     def config_fields(cls) -> list[ConfigField]:
         return [
             ConfigField("rtsp_url", str, "rtsp://0.0.0.0:554/stream", "RTSP URL"),
+            # Web-only: the on-device editor picks the first device-editable
+            # string field, and a credential must never be the one it opens
+            # in plain text on a stage projector.
+            ConfigField("rtsp_user", str, "", "Username", device_editable=False),
+            ConfigField("rtsp_password", str, "", "Password", device_editable=False, strip=False),
         ]
 
     @classmethod
@@ -71,6 +76,18 @@ class RtspInput(VideoInputBase):
             factory.set_rank(Gst.Rank.MARGINAL)
             logger.info("Decoder priority: openh264dec -> MARGINAL")
 
+    @staticmethod
+    def _credentials(config: dict[str, Any]) -> tuple[str, str]:
+        """Return the configured ``(user, password)``, blank when unset.
+
+        The password is taken verbatim – edge whitespace can be part of it and
+        is invisible in a password field – while the username is stripped, so
+        a pasted identifier with a trailing space still authenticates.
+        """
+        user = str(config.get("rtsp_user", "") or "").strip()
+        password = str(config.get("rtsp_password", "") or "")
+        return user, password
+
     def create_pipeline(
         self,
         config: dict[str, Any],
@@ -89,7 +106,8 @@ class RtspInput(VideoInputBase):
 
         self._prefer_hardware_decoders()
 
-        rtsp_url = config.get("rtsp_url", "rtsp://0.0.0.0:554/stream")
+        rtsp_url = str(config.get("rtsp_url", "rtsp://0.0.0.0:554/stream"))
+        user, password = self._credentials(config)
 
         pipeline = Gst.Pipeline.new("rtsp-sink")
 
@@ -97,14 +115,25 @@ class RtspInput(VideoInputBase):
         rtspsrc = Gst.ElementFactory.make("rtspsrc", "rtspsrc")
         if rtspsrc is None:
             raise RuntimeError("rtspsrc GStreamer element not found -- install gst-plugins-good")
-        rtspsrc.set_property("location", rtsp_url)
+        # With explicit credentials, hand over a bare location: rtspsrc tries
+        # the URL's own userinfo first, so a stale one left in the URL would
+        # outrank what the operator typed into the login fields.
+        location = strip_uri_userinfo(rtsp_url) if (user or password) else rtsp_url
+        rtspsrc.set_property("location", location)
+        if user or password:
+            rtspsrc.set_property("user-id", user)
+            rtspsrc.set_property("user-pw", password)
         rtspsrc.set_property("latency", 0)
         rtspsrc.set_property("drop-on-latency", True)
         rtspsrc.set_property("buffer-mode", 0)  # none – lowest latency
         # Allow TCP + UDP + UDP-multicast so RTSP can negotiate the best working
         # transport for the current network (Pi/macOS/firewall differences).
         rtspsrc.set_property("protocols", 0x00000007)
-        logger.info("RTSP source: %s (latency=0, tcp+udp+multicast)", redact_uri(rtsp_url))
+        logger.info(
+            "RTSP source: %s (latency=0, tcp+udp+multicast, login=%s)",
+            redact_uri(location),
+            "set" if (user or password) else "none",
+        )
 
         decodebin = Gst.ElementFactory.make("decodebin", "decodebin")
 
@@ -195,12 +224,26 @@ class RtspInput(VideoInputBase):
     @classmethod
     def web_ui_html(cls, config: dict[str, Any]) -> str:
         rtsp_url = cls._esc(config.get("rtsp_url", "rtsp://0.0.0.0:554/stream"))
+        rtsp_user = cls._esc(config.get("rtsp_user", ""))
+        rtsp_password = cls._esc(config.get("rtsp_password", ""))
         return (
             '<div class="row">'
             '    <div class="field wide">'
             "        <label>RTSP URL</label>"
             f'        <input type="text" name="rtsp_url" value="{rtsp_url}"'
             '               placeholder="rtsp://192.168.0.182:554/stream">'
+            "    </div>"
+            "</div>"
+            '<div class="row">'
+            '    <div class="field">'
+            "        <label>Username (optional)</label>"
+            f'        <input type="text" name="rtsp_user" value="{rtsp_user}"'
+            '               autocomplete="off">'
+            "    </div>"
+            '    <div class="field">'
+            "        <label>Password (optional)</label>"
+            f'        <input type="password" name="rtsp_password" value="{rtsp_password}"'
+            '               autocomplete="off">'
             "    </div>"
             "</div>"
         )

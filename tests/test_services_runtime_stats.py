@@ -72,10 +72,20 @@ class _FakeOverlayRenderer:
 
 @dataclass
 class _FakeStatusMarker:
+    """Models the real marker, including that readers take one snapshot.
+
+    ``NdiStatusMarker`` publishes its four fields as an immutable unit and
+    requires multi-field readers to go through ``snapshot()``; a fake that also
+    answered bare property reads would let that contract be broken silently.
+    """
+
     status: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(name="PLAYING"))
     is_connected: bool = True
     reconnect_attempt: int = 2
     error_message: str = "prev reset"
+
+    def snapshot(self) -> _FakeStatusMarker:
+        return self
 
 
 class _FakeReceiver:
@@ -500,7 +510,9 @@ class TestPublishRuntimeStats:
         assert snap["system"]["ram_percent"] == 0.0
         assert snap["system"]["temperature_c"] is None
         assert snap["system"]["ip"] == "N/A"
-        assert snap["video"]["fps"] == 0.0
+        assert snap["system"]["hud_fps"] == 0.0
+        # No overlay renderer ⇒ nothing is drawing ⇒ no canvas to report.
+        assert snap["system"]["output_resolution"] is None
 
     def test_system_stats_with_none_temperature(
         self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
@@ -604,3 +616,206 @@ class TestGamepadRuntimeSnapshot:
                 "calibration_stored": True,
             }
         ]
+
+
+# --------------------------------------------------------------------------- #
+# Device figures – overlay redraw rate + output resolution
+# --------------------------------------------------------------------------- #
+
+
+class _FakeSizedCanvas:
+    def __init__(self, size: tuple[int, int] = (1920, 1200)) -> None:
+        self._size = size
+
+    def get_canvas_size(self) -> tuple[int, int]:
+        return self._size
+
+
+class _TearingStatusMarker:
+    """A marker that changes generation between bare property reads.
+
+    The real ``NdiStatusMarker`` publishes its four fields as one immutable
+    unit precisely because a writer on the GStreamer bus thread can land
+    between a reader's property accesses. A fake that answers every read from
+    the same object cannot tell the two reading styles apart, so this one
+    advances on each bare read and freezes on ``snapshot()``.
+    """
+
+    _GENERATIONS = (
+        SimpleNamespace(
+            status=SimpleNamespace(name="CONNECTED"),
+            is_connected=True,
+            reconnect_attempt=0,
+            error_message="",
+        ),
+        SimpleNamespace(
+            status=SimpleNamespace(name="DISCONNECTED"),
+            is_connected=False,
+            reconnect_attempt=3,
+            error_message="Unauthorized",
+        ),
+    )
+
+    def __init__(self) -> None:
+        self._n = 0
+
+    def _current(self) -> SimpleNamespace:
+        return self._GENERATIONS[min(self._n, len(self._GENERATIONS) - 1)]
+
+    def _advance(self) -> SimpleNamespace:
+        current = self._current()
+        self._n += 1
+        return current
+
+    @property
+    def status(self) -> SimpleNamespace:
+        return self._advance().status
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._advance().is_connected)
+
+    @property
+    def reconnect_attempt(self) -> int:
+        return int(self._advance().reconnect_attempt)
+
+    @property
+    def error_message(self) -> str:
+        return str(self._advance().error_message)
+
+    def snapshot(self) -> SimpleNamespace:
+        return self._current()
+
+
+class TestStatusIsReadAsOneUnit:
+    def test_a_mid_read_transition_cannot_publish_a_mixed_state(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Four separate reads can each land in a different generation.
+
+        The Video panel decides whether to raise the failure banner from
+        ``connected`` and ``error_message`` together, so a torn read can report
+        a connected pipeline that is not connected - and swallow the banner for
+        that poll.
+        """
+        import openfollow.video.detection as det
+
+        monkeypatch.setattr(det, "check_detection_dependencies", lambda cfg: [])
+        receiver = _FakeReceiver()
+        receiver.status_marker = _TearingStatusMarker()  # type: ignore[assignment]
+        services._system_stats = _FakeSystemStatsCollector()
+        services._overlay_renderer = _FakeOverlayRenderer()
+        services._app._video_receiver = receiver
+
+        services.publish_runtime_stats(force=True)
+        video = services.get_runtime_stats_snapshot()["video"]
+
+        assert (video["pipeline_state"] == "connected") is video["connected"]
+        assert bool(video["error_message"]) is not video["connected"]
+
+
+class TestDeviceFigures:
+    """The redraw rate and the canvas size describe the station, not the feed.
+
+    An operator reading a healthy redraw rate next to a resolution concluded
+    video was flowing when nothing had ever connected, so these two live under
+    Device and the video section carries neither.
+    """
+
+    def _prime(
+        self,
+        services: AppRuntimeServices,
+        *,
+        hud_fps: float,
+        canvas: Any,
+        receiver: _FakeReceiver | None = None,
+    ) -> None:
+        services._system_stats = _FakeSystemStatsCollector()
+        services._overlay_renderer = _FakeOverlayRenderer(fps=hud_fps)
+        services._app._canvas = canvas
+        services._app._video_receiver = receiver
+
+    def _publish(self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        import openfollow.video.detection as det
+
+        monkeypatch.setattr(det, "check_detection_dependencies", lambda cfg: [])
+        services.publish_runtime_stats(force=True)
+        return services.get_runtime_stats_snapshot()
+
+    def test_publishes_redraw_rate_and_live_canvas_under_device(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._prime(services, hud_fps=59.75, canvas=_FakeSizedCanvas((1920, 1200)))
+        snap = self._publish(services, monkeypatch)
+        assert snap["system"]["hud_fps"] == 59.75
+        assert snap["system"]["output_resolution"] == {"width": 1920, "height": 1200}
+
+    @pytest.mark.parametrize("receiver", [None, _FakeReceiver()], ids=["no-receiver", "receiver"])
+    def test_video_section_carries_no_device_figure(
+        self,
+        services: AppRuntimeServices,
+        monkeypatch: pytest.MonkeyPatch,
+        receiver: _FakeReceiver | None,
+    ) -> None:
+        """The redraw rate is not a third measurement of the feed, so it is not
+        reported beside the ones that are. Both branches of the video snapshot
+        are checked: the live one is the only one production takes.
+        """
+        self._prime(services, hud_fps=59.75, canvas=_FakeSizedCanvas(), receiver=receiver)
+        snap = self._publish(services, monkeypatch)
+        assert "fps" not in snap["video"]
+        assert snap["system"]["hud_fps"] == 59.75
+
+    def test_headless_station_reports_no_canvas(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no compositor frame clock nothing draws, and the window's
+        allocation falls back to the *requested* size - which under fullscreen
+        is routinely not the real canvas. Report nothing rather than that.
+        """
+        self._prime(services, hud_fps=0.0, canvas=_FakeSizedCanvas((1280, 720)))
+        snap = self._publish(services, monkeypatch)
+        assert snap["system"]["hud_fps"] == 0.0
+        assert snap["system"]["output_resolution"] is None
+
+    @pytest.mark.parametrize("canvas", [None, SimpleNamespace(), _FakeSizedCanvas((0, 0))])
+    def test_unusable_canvas_reports_none(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch, canvas: Any
+    ) -> None:
+        self._prime(services, hud_fps=59.75, canvas=canvas)
+        snap = self._publish(services, monkeypatch)
+        assert snap["system"]["output_resolution"] is None
+
+    def test_a_raising_canvas_read_cannot_stall_the_frame_loop(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``publish_runtime_stats`` runs on the frame loop *ahead* of the
+        liveness stamp. A raising GTK read here would stop
+        ``_last_frame_completed`` advancing, so the watchdog would report a
+        permanent stall - and freeze every other figure on the page - for a
+        loop that is in fact running. One unreadable row is the cheap loss.
+        """
+
+        class _RaisingCanvas:
+            def get_canvas_size(self) -> tuple[int, int]:
+                raise RuntimeError("window is being destroyed")
+
+        self._prime(services, hud_fps=59.75, canvas=_RaisingCanvas())
+        snap = self._publish(services, monkeypatch)
+        assert snap["system"]["output_resolution"] is None
+        # The rest of the snapshot still published.
+        assert snap["system"]["hud_fps"] == 59.75
+        assert snap["system"]["ip"] == "10.0.0.7"
+
+    def test_a_canvas_returning_the_wrong_shape_reports_none(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same contract for the unpack: a non-pair raises ``ValueError``."""
+
+        class _WrongShapeCanvas:
+            def get_canvas_size(self) -> Any:
+                return (1920, 1200, 60)
+
+        self._prime(services, hud_fps=59.75, canvas=_WrongShapeCanvas())
+        snap = self._publish(services, monkeypatch)
+        assert snap["system"]["output_resolution"] is None

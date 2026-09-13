@@ -787,7 +787,6 @@ class TestPlayNoSourceSelection:
         r = _make_receiver(on_widget_changed=widgets.append)
         fake_pipeline = FakePipeline()
         r._pipeline_assembler.create_placeholder_pipeline = lambda: fake_pipeline
-        r._pipeline_assembler._placeholder_resolution = (1920, 1080)
         # Sink widget must be present so the widget-callback branch is
         # exercised in addition to placeholder construction.
         sink = r._get_shared_sink()
@@ -796,10 +795,11 @@ class TestPlayNoSourceSelection:
         r.play()
 
         assert FakeState.PLAYING in fake_pipeline.state_changes
-        # Observable placeholder effects: the assembler's placeholder
-        # resolution is published via the public `resolution` property,
-        # and the receiver never transitions to connected.
-        assert r.resolution == (1920, 1080)
+        # Observable placeholder effects: the receiver flags the placeholder
+        # pipeline, publishes no source geometry for it, and never transitions
+        # to connected.
+        assert r._state.is_placeholder_pipeline is True
+        assert r.resolution == (0, 0)
         assert r.connected is False
         # Widget change callback fires once with the sink widget.
         assert len(widgets) == 1
@@ -810,9 +810,6 @@ class TestPlayNoSourceSelection:
         r = _make_receiver(input_config={"fake_source": "cam-1"})
         fake_pipeline = FakePipeline()
         FakeInput.create_pipeline_result = fake_pipeline
-        # Set the placeholder resolution to a distinctive value so we can
-        # tell placeholder-path from happy-path through `r.resolution`.
-        r._pipeline_assembler._placeholder_resolution = (1920, 1080)
         r._pipeline_assembler.create_placeholder_pipeline = lambda: fake_pipeline
 
         r.play()
@@ -939,35 +936,35 @@ class TestCreatePipeline:
         monkeypatch.setattr(FakeInput, "_available", (False, "SDK missing"))
         r = _make_receiver(input_config={"fake_source": "cam-1"})
         placeholder = FakePipeline()
-        r._pipeline_assembler._placeholder_resolution = (1920, 1080)
         r._pipeline_assembler.create_placeholder_pipeline = lambda: placeholder
 
         r.create_pipeline()
 
         # Observable effects of the placeholder path:
         #   * status marker is set to disconnected with the reason text
-        #   * resolution is published as the placeholder's fixed resolution
+        #   * the placeholder is flagged and publishes no source geometry
         #   * the plugin's create_pipeline is never invoked
         assert r.connected is False
         assert r.status_marker.error_message == "SDK missing"
-        assert r.resolution == (1920, 1080)
+        assert r._state.is_placeholder_pipeline is True
+        assert r.resolution == (0, 0)
         assert FakeInput.create_pipeline_call_count == 0
 
     def test_plugin_raises_falls_back_to_placeholder(self, fake_gst, fake_glib, fake_input_cls) -> None:
         FakeInput.create_pipeline_raises = RuntimeError("boom")
         r = _make_receiver(input_config={"fake_source": "cam-1"})
         placeholder = FakePipeline()
-        r._pipeline_assembler._placeholder_resolution = (1920, 1080)
         r._pipeline_assembler.create_placeholder_pipeline = lambda: placeholder
 
         r.create_pipeline()
 
         # The exception text propagates to the public status marker, the
-        # placeholder resolution surfaces via the public `resolution` property,
-        # and the receiver stays disconnected.
+        # placeholder is flagged and publishes no geometry of its own, and the
+        # receiver stays disconnected.
         assert r.connected is False
         assert "boom" in r.status_marker.error_message
-        assert r.resolution == (1920, 1080)
+        assert r._state.is_placeholder_pipeline is True
+        assert r.resolution == (0, 0)
         assert FakeInput.create_pipeline_call_count == 1
 
     def test_happy_path_sets_up_bus_and_pad_probe(self, fake_gst, fake_glib, fake_input_cls) -> None:
@@ -1448,6 +1445,70 @@ class TestReconnect:
         assert result is False
         assert FakeState.PLAYING in fake_pipeline.state_changes
 
+    def test_fallback_to_placeholder_keeps_the_failure_reason(self, fake_gst, fake_glib, fake_input_cls) -> None:
+        """The reason survives giving up, because that is when it is read.
+
+        An RTSP camera refusing a login reports ``Unauthorized (401)`` on every
+        attempt and then the retries run out - so by the time an operator looks
+        at the panel, a generic "No <input> connection" is all they would see.
+        That sentence says no more than the Signal row, and the 401 is the
+        whole diagnosis.
+        """
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._pipeline_assembler.create_placeholder_pipeline = lambda: FakePipeline()
+        r._status_marker.set_reconnecting(3, "Unauthorized (401)")
+        r._state.reconnect_attempt = 99  # past max_attempts → fallback path
+
+        r._do_reconnect()
+
+        assert r._state.is_placeholder_pipeline is True
+        assert r.status_marker.error_message == "Unauthorized (401)"
+
+    def test_a_progress_note_is_never_published_as_the_failure_reason(
+        self, fake_gst, fake_glib, fake_input_cls
+    ) -> None:
+        """Cancelling source selection schedules a reconnect that is progress,
+        not a failure. An input with ``max_attempts=1`` (NDI) falls back on the
+        very next attempt, so storing that note as the error would have the
+        banner say "Reconnecting to previous source" at the moment the receiver
+        gave up - worse than the generic it replaced.
+        """
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._pipeline_assembler.create_placeholder_pipeline = lambda: FakePipeline()
+        r._state.enter_source_selection()
+        r.exit_source_selection()
+        r._state.reconnect_attempt = 99
+
+        r._do_reconnect()
+
+        assert "Reconnecting" not in r.status_marker.error_message
+        assert r.status_marker.error_message == "No Fake connection"
+
+    def test_fallback_falls_back_to_a_generic_reason_when_none_was_recorded(
+        self, fake_gst, fake_glib, fake_input_cls
+    ) -> None:
+        """Nothing ever reported a cause – say something rather than nothing."""
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._pipeline_assembler.create_placeholder_pipeline = lambda: FakePipeline()
+        r._state.reconnect_attempt = 99
+
+        r._do_reconnect()
+
+        assert r.status_marker.error_message == "No Fake connection"
+
+    def test_fallback_reason_is_credential_free(self, fake_gst, fake_glib, fake_input_cls) -> None:
+        """The carried reason goes back through the marker, so the redaction
+        that made it safe on the way in still holds on the way out."""
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._pipeline_assembler.create_placeholder_pipeline = lambda: FakePipeline()
+        r._status_marker.set_reconnecting(3, "Unauthorized: rtsp://operator:hunter2@cam.local:554/s")
+        r._state.reconnect_attempt = 99
+
+        r._do_reconnect()
+
+        assert "hunter2" not in r.status_marker.error_message
+        assert "cam.local:554/s" in r.status_marker.error_message
+
     def test_do_reconnect_reschedules_when_build_fails_into_placeholder(
         self, fake_gst, fake_glib, fake_input_cls
     ) -> None:
@@ -1673,6 +1734,37 @@ class TestPadEvent:
         r._on_pad_event(object(), info)
         assert r.source_framerate == 0.0
 
+    def test_placeholder_caps_crossing_the_shared_sink_write_no_source_state(
+        self, fake_gst, fake_glib, fake_input_cls
+    ) -> None:
+        """The probe is attached once for the shared sink's lifetime, and the
+        placeholder feeds that same sink - so its 1920x1080 @ 30 reaches this
+        callback. Publishing it would present a source that has never
+        delivered a frame as a working 1080p feed.
+        """
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._state.set_placeholder_pipeline(True)
+
+        info, _ = self._make_caps_event(1920, 1080, fps_num=30, fps_den=1)
+        r._on_pad_event(object(), info)
+
+        assert r.resolution == (0, 0)
+        assert r.source_framerate == 0.0
+        assert r.connected is False
+
+    def test_real_caps_after_a_placeholder_publish_normally(self, fake_gst, fake_glib, fake_input_cls) -> None:
+        """The gate is the placeholder flag, not a one-way latch: the real
+        pipeline that replaces it must still report its own geometry."""
+        r = _make_receiver(input_config={"fake_source": "cam-1"})
+        r._state.set_placeholder_pipeline(True)
+        r._on_pad_event(object(), self._make_caps_event(1920, 1080)[0])
+
+        r._state.set_placeholder_pipeline(False)
+        r._on_pad_event(object(), self._make_caps_event(1024, 768, fps_num=25)[0])
+
+        assert r.resolution == (1024, 768)
+        assert r.source_framerate == 25.0
+
 
 # --------------------------------------------------------------------------- #
 # Placeholder pipeline wiring
@@ -1680,17 +1772,25 @@ class TestPadEvent:
 
 
 class TestPlaceholderWiring:
-    def test_create_placeholder_applies_resolution_and_bus(self, fake_gst, fake_glib, fake_input_cls) -> None:
+    def test_create_placeholder_clears_source_caps_and_wires_bus(self, fake_gst, fake_glib, fake_input_cls) -> None:
+        """The "No Signal" picture is ours, so it publishes no source geometry.
+
+        A prior source's figures must not survive under it either: the panel
+        would otherwise keep reporting a resolution and rate for a feed that
+        has stopped delivering frames.
+        """
         r = _make_receiver()
         fake_pipeline = FakePipeline()
         r._pipeline_assembler.create_placeholder_pipeline = lambda: fake_pipeline
-        r._pipeline_assembler._placeholder_resolution = (640, 360)
+        r._state.set_resolution(1280, 720)
+        r._state.set_source_framerate(25.0)
 
         r._create_placeholder_pipeline()
         assert r._pipeline is fake_pipeline
         assert fake_pipeline._bus.signal_watch_added is True
         assert r._state.is_placeholder_pipeline is True
-        assert r.resolution == (640, 360)
+        assert r.resolution == (0, 0)
+        assert r.source_framerate == 0.0
 
     def test_create_placeholder_returns_early_when_assembler_returns_none(
         self, fake_gst, fake_glib, fake_input_cls

@@ -790,7 +790,12 @@ class GstNativeSinkReceiver:
         if self._state.restore_connection_after_selection():
             self._status_marker.set_connected(source_label)
         elif source_label:
-            self._schedule_reconnect("Reconnecting to previous source")
+            # No message: this is progress, not a failure. Passing one would
+            # store it as the error, and an input with ``max_attempts=1`` (NDI)
+            # falls back on the very next attempt and would publish
+            # "Reconnecting to previous source" as the terminal reason - saying
+            # it is still trying at the moment it gave up.
+            self._schedule_reconnect()
         else:
             self._status_marker.set_disconnected("Source selection cancelled")
 
@@ -826,8 +831,9 @@ class GstNativeSinkReceiver:
         self._pipeline = pipeline
         self._setup_bus()
         self._state.set_placeholder_pipeline(True)
-        width, height = self._pipeline_assembler.placeholder_resolution
-        self._state.set_resolution(width, height)
+        # The "No Signal" frame is ours, not the source's: report no geometry
+        # and no rate while it is up rather than the black pattern's.
+        self._state.clear_source_caps()
 
     # -- Bus handling ---------------------------------------------------------
 
@@ -982,16 +988,22 @@ class GstNativeSinkReceiver:
             )
 
             self._state.reset_reconnect_backoff()
+            # Keep the reason that actually got us here. The last attempt's
+            # error is what tells the operator whether to check the password,
+            # the cable or the encoder - an RTSP camera refusing a login
+            # reports "Unauthorized (401)" on every attempt, and replacing that
+            # with "No RTSP connection" discards the whole diagnosis for a
+            # sentence that says no more than the Signal row already does.
+            reason = self._status_marker.error_message or f"No {self._input.display_name} connection"
             if self._input_caps.has_source_selection:
                 # Clear primary config field for selection-based inputs.
                 if self._input.config_fields():
                     primary_field = self._input.config_fields()[0].name
                     self._input_config[primary_field] = ""
                 self._state.activate_source_selection()
-                self._status_marker.set_disconnected(f"No {self._input.display_name} connection")
             else:
                 self._state.deactivate_source_selection()
-                self._status_marker.set_disconnected(f"No {self._input.display_name} connection")
+            self._status_marker.set_disconnected(reason)
 
             self._create_placeholder_pipeline()
             if self._input_caps.has_source_discovery:

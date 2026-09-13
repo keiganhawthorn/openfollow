@@ -833,6 +833,7 @@ class AppRuntimeServices:
         try:
             receiver.start()
             self._app._video_logged = False
+            self._app._video_aspect = None
 
             # Adopt the detector only once the receiver is up; the receiver
             # holds its own ``detector`` ref and tears it down on ``stop()``.
@@ -2554,6 +2555,35 @@ class AppRuntimeServices:
             max(1, int(height)),
         )
 
+    def _canvas_resolution(self, hud_fps: float) -> dict[str, int] | None:
+        """Return the live HUD canvas size, or ``None`` when nothing is drawing.
+
+        Read from the window's allocation rather than ``window_width`` /
+        ``window_height``: those are the *requested* size, and under Cage
+        fullscreen the real canvas is the display's resolution instead. The
+        HUD redraw rate gates it because the GTK window exists on a headless
+        station too - with no compositor frame clock it never draws, and its
+        allocation falls back to exactly that requested pair.
+        """
+        if hud_fps <= 0.0:
+            return None
+        getter = getattr(self._app._canvas, "get_canvas_size", None)
+        if getter is None:
+            return None
+        try:
+            width, height = getter()
+        except Exception:
+            # ``publish_runtime_stats`` runs on the frame loop *ahead* of the
+            # liveness stamp, so a raising GTK read would stop
+            # ``_last_frame_completed`` advancing and report a permanent stall
+            # for a loop that is in fact running - while freezing every other
+            # figure on the page with it. One unreadable row is the cheap loss.
+            logger.debug("Canvas size unavailable for runtime stats", exc_info=True)
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return {"width": int(width), "height": int(height)}
+
     def _default_runtime_stats_snapshot(self) -> dict[str, Any]:
         cfg = self._app._config
         return {
@@ -2563,6 +2593,8 @@ class AppRuntimeServices:
                 "ram_percent": 0.0,
                 "temperature_c": None,
                 "ip": "N/A",
+                "hud_fps": 0.0,
+                "output_resolution": None,
             },
             "video": {
                 "source_type": cfg.video_source_type,
@@ -2573,7 +2605,6 @@ class AppRuntimeServices:
                 "error_message": "",
                 "resolution": {"width": 0, "height": 0},
                 "source_selection_active": False,
-                "fps": 0.0,
                 "source_fps": 0.0,
             },
             "controllers": {
@@ -2651,9 +2682,9 @@ class AppRuntimeServices:
         )
         ip_address = system_stats.ip_address if system_stats is not None else "N/A"
 
-        fps = 0.0
+        hud_fps = 0.0
         if self._overlay_renderer is not None:
-            fps = float(self._overlay_renderer.measured_fps())
+            hud_fps = float(self._overlay_renderer.measured_fps())
 
         video_snapshot: dict[str, Any] = {
             "source_type": cfg.video_source_type,
@@ -2664,12 +2695,15 @@ class AppRuntimeServices:
             "error_message": "",
             "resolution": {"width": 0, "height": 0},
             "source_selection_active": False,
-            "fps": fps,
             "source_fps": 0.0,
         }
         receiver = getattr(app, "_video_receiver", None)
         if receiver is not None:
-            status = receiver.status_marker
+            # One consistent unit, per ``NdiStatusMarker.snapshot``: four
+            # separate property reads can each land in a different generation,
+            # and the Video panel reads ``connected`` and ``error_message``
+            # together to decide whether to raise the failure banner.
+            status = receiver.status_marker.snapshot()
             width, height = receiver.resolution
             video_snapshot = {
                 "source_type": cfg.video_source_type,
@@ -2680,7 +2714,6 @@ class AppRuntimeServices:
                 "error_message": status.error_message,
                 "resolution": {"width": int(width), "height": int(height)},
                 "source_selection_active": bool(receiver.source_selection_active),
-                "fps": fps,
                 "source_fps": float(getattr(receiver, "source_framerate", 0.0)),
             }
 
@@ -2736,6 +2769,8 @@ class AppRuntimeServices:
                 "ram_percent": ram_percent,
                 "temperature_c": temperature,
                 "ip": ip_address,
+                "hud_fps": hud_fps,
+                "output_resolution": self._canvas_resolution(hud_fps),
             },
             "video": video_snapshot,
             "controllers": {

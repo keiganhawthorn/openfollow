@@ -74,16 +74,20 @@ def _fake_app(
     raise_on_resolution: bool = False,
 ) -> SimpleNamespace:
     class _Receiver:
+        def __init__(inner_self) -> None:  # noqa: N805
+            inner_self.current = resolution
+
         @property
         def resolution(inner_self):  # noqa: N805
             if raise_on_resolution:
                 raise RuntimeError("pipeline stalled")
-            return resolution
+            return inner_self.current
 
     return SimpleNamespace(
         _video_receiver=_Receiver(),
         _canvas=canvas if canvas is not None else _FakeCanvas(),
         _video_logged=video_logged,
+        _video_aspect=None,
     )
 
 
@@ -106,15 +110,75 @@ class TestUpdateVideo:
         matching = [r for r in caplog.records if "Native sink" in r.message]
         assert matching == []
 
-    def test_applies_aspect_ratio_once(self) -> None:
+    def test_unchanged_resolution_does_not_reapply_the_hint(self) -> None:
         canvas = _FakeCanvas(has_set_aspect_ratio=True)
         app = _fake_app(resolution=(1920, 1080), canvas=canvas)
         logger = logging.getLogger("test-update-video")
         update_video(app, logger)
         update_video(app, logger)
-        # `_video_logged` alone gates the once-only path.
         assert canvas.aspect_calls == [(1920, 1080)]
         assert app._video_logged is True
+
+    def test_hint_follows_the_source_across_a_placeholder_fallback(self) -> None:
+        """Connect 16:9, drop to the placeholder, reconnect 4:3.
+
+        The window must end up shaped like the source that is actually
+        playing: the HUD is projected across the canvas while calibration is
+        solved against the input, so a hint left at the first figure of the
+        session slides the overlay off the video for the rest of it.
+        """
+        canvas = _FakeCanvas(has_set_aspect_ratio=True)
+        app = _fake_app(resolution=(1920, 1080), canvas=canvas)
+        logger = logging.getLogger("test-update-video")
+        update_video(app, logger)
+
+        # Placeholder up: no source geometry is published at all.
+        app._video_receiver.current = (0, 0)
+        update_video(app, logger)
+
+        app._video_receiver.current = (1024, 768)
+        update_video(app, logger)
+
+        assert canvas.aspect_calls == [(1920, 1080), (1024, 768)]
+
+    def test_an_aspect_preserving_resolution_change_does_not_re_hint(self) -> None:
+        """1920x1080 -> 1280x720 is the same shape, so the window is already
+        constrained correctly and there is nothing to re-apply."""
+        canvas = _FakeCanvas(has_set_aspect_ratio=True)
+        app = _fake_app(resolution=(1920, 1080), canvas=canvas)
+        logger = logging.getLogger("test-update-video")
+        update_video(app, logger)
+        app._video_receiver.current = (1280, 720)
+        update_video(app, logger)
+        assert canvas.aspect_calls == [(1920, 1080)]
+
+    def test_a_raising_hint_is_attempted_once_not_every_frame(self) -> None:
+        """The latch this replaced tried once. Recording the shape only on
+        success would retry a raising GTK call 60 times a second for the rest
+        of the session."""
+
+        class _RaisingCanvas:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def set_aspect_ratio(self, w: int, h: int) -> None:
+                self.calls += 1
+                raise RuntimeError("window is being destroyed")
+
+        canvas = _RaisingCanvas()
+        app = _fake_app(resolution=(1920, 1080), canvas=canvas)
+        logger = logging.getLogger("test-update-video")
+        for _ in range(5):
+            update_video(app, logger)
+        assert canvas.calls == 1
+
+    def test_first_logged_resolution_does_not_gate_later_hints(self) -> None:
+        """The one-shot log line and the aspect hint are separate concerns."""
+        canvas = _FakeCanvas(has_set_aspect_ratio=True)
+        app = _fake_app(resolution=(1280, 720), canvas=canvas, video_logged=True)
+        logger = logging.getLogger("test-update-video")
+        update_video(app, logger)
+        assert canvas.aspect_calls == [(1280, 720)]
 
     def test_zero_resolution_skips_logging_and_aspect_ratio(self) -> None:
         canvas = _FakeCanvas(has_set_aspect_ratio=True)

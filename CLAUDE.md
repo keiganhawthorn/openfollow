@@ -599,8 +599,8 @@ and "manage X under Y" pointers – goes in that section's **help drawer markdow
 | `/section/general` | POST | Save + apply general settings |
 | `/video-input/ndi/sources` | GET | NDI source `<option>` list (served by the NDI plugin's `web_routes()`) |
 | `/network/interfaces/by_name` | GET | Interface `<option>` list (iface-keyed) |
-| `/section/network/status` | GET | Network read-only view; `/section/network/edit` → editable form |
-| `/section/network` | POST | Re-render edit form on interface/method change – no write |
+| `/section/network/status` | GET | The interface card, every row read-only |
+| `/section/network/edit/<iface>` | GET | Same card with that one interface's row editable |
 | `/section/network/apply` | POST | Validate + write IPv4 config via the privileged adapter |
 | `/section/network/renew` | POST | Renew DHCP lease via the privileged adapter |
 | `/api/info` | GET | JSON: system_name, ip, port |

@@ -963,6 +963,7 @@ def get_section_data(cfg: AppConfig, section: str) -> dict[str, Any] | None:
 _INTERFACE_ASSIGNMENT_TARGETS: dict[str, tuple[str | None, str]] = {
     "psn_source_iface": (None, "psn_source_iface"),
     "otp_output.source_iface": ("otp_output", "source_iface"),
+    "osc.listen_iface": ("osc", "listen_iface"),
     "web_bind_iface": (None, "web_bind_iface"),
 }
 
@@ -975,6 +976,10 @@ _DEVICE_LOCAL_FIELDS_BY_SECTION: dict[str, frozenset[str]] = {
     # The OTP source interface pins THIS device's NIC by name – like
     # ``psn_source_iface``, it must not cross machines via broadcast/import.
     "otp_output": frozenset({"source_iface"}),
+    # ``listen_iface`` names the NIC this station's OSC receiver binds. A pin
+    # from another machine would either dangle or, worse, resolve to a
+    # different network here and take the receiver off the one it was on.
+    "osc": frozenset({"listen_iface"}),
     # ``storage_path`` is an absolute filesystem path on THIS device (NVMe
     # mount or a local working dir). A path from another machine is invalid
     # here – it must never cross via broadcast/import. Blank means auto-resolve.
@@ -1105,6 +1110,24 @@ def _web_bind_address(cfg: AppConfig, resolved: tuple[str, str]) -> str:
     return host
 
 
+def _osc_listen_address(cfg: AppConfig) -> str:
+    """Address column for the OSC input row: where the listener will answer.
+
+    Unpinned it binds every interface, so the row says so rather than naming
+    the address auto-detection would pick for a *sender* - the listener is not
+    restricted to that one, and a row implying it was would misread every other
+    address the station answers OSC on.
+    """
+    from openfollow.net_utils import plane_source_iface, resolve_listen_bind
+
+    host, status = resolve_listen_bind(cfg.osc.listen_iface, cfg.psn_source_iface)
+    if status == "down":
+        return f"{plane_source_iface(cfg.osc.listen_iface, cfg.psn_source_iface)} is down"
+    if status == "none":
+        return "All interfaces"
+    return host
+
+
 def build_web_bind_notice(cfg: AppConfig, resolved: tuple[str, str], display_port: int) -> str:
     """Lockout warning for a pinned web UI, naming the URL that will reach it.
 
@@ -1191,6 +1214,14 @@ def build_interface_assignment_rows(cfg: AppConfig, web_bind: tuple[str, str] | 
             "label": "OTP output",
             "value": cfg.otp_output.source_iface,
             "address": _addr(cfg.otp_output.source_iface),
+            "editable": True,
+            "blank": "station",
+        },
+        {
+            "key": "osc.listen_iface",
+            "label": "OSC input",
+            "value": cfg.osc.listen_iface,
+            "address": _osc_listen_address(cfg),
             "editable": True,
             "blank": "station",
         },
@@ -1817,6 +1848,7 @@ _SECTION_FIELD_PARSERS: dict[str, dict[str, _FieldParser]] = {
         "port": _as_int,
         "allowed_sender_ips": _as_ip_list,
         "multicast_group": _as_str,
+        "listen_iface": _as_str,
     },
     "operator_messages": {
         "enabled": _as_bool,

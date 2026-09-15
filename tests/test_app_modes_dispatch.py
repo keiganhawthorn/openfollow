@@ -1072,7 +1072,7 @@ def test_build_settings_menu_items_disables_controller_dependent_items(
 
     monkeypatch.setattr(webkit_browser, "AVAILABLE", True)
     app = _make_settings_menu_app(has_controller=False, has_source=False)
-    labels, enabled, _reasons = app_modes.build_settings_menu_items(app)
+    labels, enabled, _reasons, _opens = app_modes.build_settings_menu_items(app)
     assert labels == [
         "Network",
         "Change Video Source",
@@ -1092,7 +1092,7 @@ def test_build_settings_menu_items_disables_controller_dependent_items(
 
 def test_build_settings_menu_items_disables_change_video_source_without_receiver() -> None:
     app = _make_settings_menu_app(has_controller=True, has_source=None)
-    labels, enabled, _reasons = app_modes.build_settings_menu_items(app)
+    labels, enabled, _reasons, _opens = app_modes.build_settings_menu_items(app)
     idx = labels.index("Change Video Source")
     assert enabled[idx] is False
 
@@ -1109,7 +1109,7 @@ def test_build_settings_menu_items_web_ui_enabled_on_mac(
     monkeypatch.setattr(webkit_browser, "AVAILABLE", False)
     monkeypatch.setattr(_sys, "platform", "darwin")
     app = _make_settings_menu_app(has_controller=True, has_source=True)
-    labels, enabled, reasons = app_modes.build_settings_menu_items(app)
+    labels, enabled, reasons, _opens = app_modes.build_settings_menu_items(app)
     idx = labels.index("Open Web UI")
     assert enabled[idx] is True
     assert reasons[idx] == ""
@@ -1126,7 +1126,7 @@ def test_build_settings_menu_items_web_ui_says_install_hint_on_linux(
     monkeypatch.setattr(webkit_browser, "AVAILABLE", False)
     monkeypatch.setattr(_sys, "platform", "linux")
     app = _make_settings_menu_app(has_controller=True, has_source=True)
-    labels, enabled, reasons = app_modes.build_settings_menu_items(app)
+    labels, enabled, reasons, _opens = app_modes.build_settings_menu_items(app)
     idx = labels.index("Open Web UI")
     assert enabled[idx] is False
     assert "gir1.2-webkit2-4.1" in reasons[idx]
@@ -1142,7 +1142,7 @@ def test_build_settings_menu_items_web_ui_no_reason_when_available(
 
     monkeypatch.setattr(webkit_browser, "AVAILABLE", True)
     app = _make_settings_menu_app(has_controller=True, has_source=True)
-    labels, enabled, reasons = app_modes.build_settings_menu_items(app)
+    labels, enabled, reasons, _opens = app_modes.build_settings_menu_items(app)
     idx = labels.index("Open Web UI")
     assert enabled[idx] is True
     assert reasons[idx] == ""
@@ -1186,7 +1186,7 @@ def test_settings_menu_move_no_op_when_no_items_enabled() -> None:
     app = SimpleNamespace(_settings_menu_index=0, _input_manager=None, _video_receiver=None)
     # Force build_settings_menu_items to return ([], [])
     saved = app_modes.build_settings_menu_items
-    app_modes.build_settings_menu_items = lambda _app: ([], [], [])
+    app_modes.build_settings_menu_items = lambda _app: ([], [], [], [])
     try:
         app_modes._settings_menu_move(app, +1)
         assert app._settings_menu_index == 0

@@ -207,18 +207,20 @@ def _back_to_settings(app: OpenFollowApp) -> None:
     app._enter_settings_menu()
 
 
-_SETTINGS_MENU_ITEMS: tuple[tuple[str, str], ...] = (
-    ("Network", "network"),
+# ``opens`` marks an entry that takes the operator to another screen rather
+# than doing something where they stand. Restart is the only one that acts.
+_SETTINGS_MENU_ITEMS: tuple[tuple[str, str, bool], ...] = (
+    ("Network", "network", True),
     # Single guided entry point for everything video: the operator picks a
     # type and is automatically routed to the right next step (URL editor for
     # RTSP/SRT/RTP/NDI, source picker for discovery-capable plugins like NDI).
-    ("Change Video Source", "change_video_source"),
-    ("Button Detection", "button_detection"),
-    ("Open Web UI", "web_ui"),
-    ("Restart", "restart"),
+    ("Change Video Source", "change_video_source", True),
+    ("Button Detection", "button_detection", True),
+    ("Open Web UI", "web_ui", True),
+    ("Restart", "restart", False),
     # Read-only license/version screen. Reachable without the embedded WebKit
     # browser so the AGPLv3 notice is always available on the device.
-    ("About", "about"),
+    ("About", "about", True),
 )
 
 
@@ -283,8 +285,8 @@ def _web_ui_disabled_reason() -> str:
 
 def build_settings_menu_items(
     app: OpenFollowApp,
-) -> tuple[list[str], list[bool], list[str]]:
-    """Return (labels, enabled_flags, disabled_reasons) for the Settings menu.
+) -> tuple[list[str], list[bool], list[str], list[bool]]:
+    """Return (labels, enabled_flags, disabled_reasons, opens_submenu) for the Settings menu.
 
     Items whose prerequisites aren't met render as disabled so the menu
     shape stays stable regardless of runtime state. ``disabled_reasons``
@@ -296,13 +298,15 @@ def build_settings_menu_items(
     labels: list[str] = []
     enabled: list[bool] = []
     reasons: list[str] = []
+    submenu: list[bool] = []
     has_controller = app._input_manager is not None and bool(app._input_manager.gamepad_handler.joysticks)
     has_video = app._video_receiver is not None
     from openfollow.runtime import webkit_browser
 
     has_browser = webkit_browser.AVAILABLE
-    for label, action in _SETTINGS_MENU_ITEMS:
+    for label, action, opens in _SETTINGS_MENU_ITEMS:
         labels.append(label)
+        submenu.append(opens)
         reason = ""
         if action == "button_detection":
             is_enabled = has_controller
@@ -326,13 +330,13 @@ def build_settings_menu_items(
             is_enabled = True
         enabled.append(is_enabled)
         reasons.append(reason)
-    return labels, enabled, reasons
+    return labels, enabled, reasons, submenu
 
 
 def _settings_menu_action(app: OpenFollowApp, index: int) -> str | None:
     if not 0 <= index < len(_SETTINGS_MENU_ITEMS):
         return None
-    _, action = _SETTINGS_MENU_ITEMS[index]
+    _, action, _opens = _SETTINGS_MENU_ITEMS[index]
     return action
 
 
@@ -391,7 +395,7 @@ def process_about_input(app: OpenFollowApp) -> None:
 
 
 def _settings_menu_move(app: OpenFollowApp, step: int) -> None:
-    _, enabled, _reasons = build_settings_menu_items(app)
+    _, enabled, _reasons, _opens = build_settings_menu_items(app)
     if not enabled:
         return
     idx = app._settings_menu_index
@@ -425,7 +429,7 @@ def open_web_ui_external(app: OpenFollowApp) -> None:
 
 
 def _settings_menu_confirm(app: OpenFollowApp) -> None:
-    _, enabled, _reasons = build_settings_menu_items(app)
+    _, enabled, _reasons, _opens = build_settings_menu_items(app)
     idx = app._settings_menu_index
     if not 0 <= idx < len(enabled) or not enabled[idx]:
         return

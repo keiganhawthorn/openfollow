@@ -1110,24 +1110,6 @@ def _web_bind_address(cfg: AppConfig, resolved: tuple[str, str]) -> str:
     return host
 
 
-def _osc_listen_address(cfg: AppConfig) -> str:
-    """Address column for the OSC input row: where the listener will answer.
-
-    Unpinned it binds every interface, so the row says so rather than naming
-    the address auto-detection would pick for a *sender* - the listener is not
-    restricted to that one, and a row implying it was would misread every other
-    address the station answers OSC on.
-    """
-    from openfollow.net_utils import plane_source_iface, resolve_listen_bind
-
-    host, status = resolve_listen_bind(cfg.osc.listen_iface, cfg.psn_source_iface)
-    if status == "down":
-        return f"{plane_source_iface(cfg.osc.listen_iface, cfg.psn_source_iface)} is down"
-    if status == "none":
-        return "All interfaces"
-    return host
-
-
 def build_web_bind_notice(cfg: AppConfig, resolved: tuple[str, str], display_port: int) -> str:
     """Lockout warning for a pinned web UI, naming the URL that will reach it.
 
@@ -1158,6 +1140,32 @@ def build_web_bind_notice(cfg: AppConfig, resolved: tuple[str, str], display_por
         "If that address is unreachable, use the Network screen on the station "
         "display to serve on all interfaces again."
     )
+
+
+def _osc_membership_address(
+    cfg: AppConfig,
+    *,
+    station_ip: str,
+    plane_address: Callable[[str], str],
+) -> str:
+    """Address column for the OSC input row: where the group is subscribed.
+
+    Unpinned there is no interface to name - the routing table picks one per
+    membership - so the row says that rather than an address the socket is not
+    restricted to. Unicast and broadcast arrive on every interface whatever
+    this row says, which is why it names the membership and not the listener.
+
+    Takes the station address the caller already resolved rather than walking
+    every adapter again: an inheriting row must agree with the Station default
+    row above it, and a second walk could disagree if an address moves
+    mid-render.
+    """
+    pin = cfg.osc.listen_iface
+    if not cfg.osc.multicast_group:
+        return "No multicast group"
+    if not pin:
+        return station_ip if cfg.psn_source_iface else "Default interface"
+    return plane_address(pin)
 
 
 def build_interface_assignment_rows(cfg: AppConfig, web_bind: tuple[str, str] | None = None) -> list[dict[str, Any]]:
@@ -1218,10 +1226,15 @@ def build_interface_assignment_rows(cfg: AppConfig, web_bind: tuple[str, str] | 
             "blank": "station",
         },
         {
+            # The pin moves the multicast membership only. The socket binds
+            # every interface either way: bound to one address it would receive
+            # no multicast and no broadcast at all, since the kernel matches a
+            # datagram's destination against the bound address and a group
+            # address is neither.
             "key": "osc.listen_iface",
             "label": "OSC input",
             "value": cfg.osc.listen_iface,
-            "address": _osc_listen_address(cfg),
+            "address": _osc_membership_address(cfg, station_ip=station_ip, plane_address=_addr),
             "editable": True,
             "blank": "station",
         },
@@ -2664,6 +2677,10 @@ def _config_dict_redacted(cfg: AppConfig) -> dict[str, Any]:
     # ``testpattern_selected_media`` is a device-local gallery item id; media
     # files never travel, so a foreign id would just dangle on another host.
     d.pop("testpattern_selected_media", None)
+    # ``osc.listen_iface`` names a NIC on this box. Carried to a station that
+    # has no such adapter it reads as a pin that is down, which drops the OSC
+    # multicast membership there until somebody finds the setting.
+    d["osc"].pop("listen_iface", None)
     return d
 
 
@@ -2741,6 +2758,8 @@ def _apply_import_data(
     # ``testpattern_selected_media`` is a device-local gallery id (media files
     # don't travel), so an imported selection must not replace this station's.
     original_selected_media = cfg.testpattern_selected_media
+    # ``osc.listen_iface`` names this box's NIC, like ``psn_source_iface``.
+    original_osc_listen_iface = cfg.osc.listen_iface
 
     # General section (top-level scalar fields)
     apply_section_data(cfg, "general", data)
@@ -2827,6 +2846,7 @@ def _apply_import_data(
     cfg.web_port = original_port
     cfg.detection.storage_path = original_storage_path
     cfg.testpattern_selected_media = original_selected_media
+    cfg.osc.listen_iface = original_osc_listen_iface
     return cfg
 
 

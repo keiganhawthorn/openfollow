@@ -2727,6 +2727,27 @@ def _active_source_endpoint(cfg: AppConfig) -> dict[str, Any] | None:
     }
 
 
+def _config_file_paths(server: ConfigWebServer, cfg: AppConfig) -> list[str]:
+    """The files this station's configuration is read from, absolute.
+
+    The catalog path goes through the same resolver the rest of the web layer
+    uses. Restating the rule here would leave the bundle reporting the mtime
+    of a file the app does not read the day that rule changes.
+    """
+    return [
+        str(Path(server.config_path)),
+        _resolve_marker_catalog_path(server.config_path, cfg.markers_catalog_path),
+    ]
+
+
+def _detection_models_dir(cfg: AppConfig) -> dict[str, str]:
+    """Where detection loads models from, and which one it is configured for."""
+    from openfollow.video.detection import resolve_detection_storage_path  # noqa: PLC0415 - import cost off module load
+
+    directory = Path(resolve_detection_storage_path(cfg.detection.storage_path)).expanduser() / "models"
+    return {"dir": str(directory), "configured": str(cfg.detection.model or "")}
+
+
 def _build_diagnostics_providers(
     server: ConfigWebServer,
     cfg: AppConfig,
@@ -2793,6 +2814,8 @@ def _build_diagnostics_providers(
         runtime_stats=server.get_runtime_stats,
         online_sync_status=server.online_sync_status_provider,
         source_endpoint=lambda: _active_source_endpoint(cfg),
+        config_file_paths=lambda: _config_file_paths(server, cfg),
+        detection_models_dir=lambda: _detection_models_dir(cfg),
         config_diff_from_defaults=lambda: _config_diff_from_defaults(cfg),
         request_semaphore_rejections=(lambda: server.request_semaphore_rejections),
         detection_install_state=server.get_detection_install_status,

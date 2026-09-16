@@ -333,14 +333,14 @@ def test_redact_config_secrets_strips_credentials_fused_into_a_url() -> None:
     """An operator told to put the password in the URL must not then have it
     printed back in a bundle we ask them to attach to a public issue."""
     out = diag.redact_config_secrets(
-        'rtsp_url = "rtsp://operator:hunter2@192.168.0.182:554/profile2/media.smp"\n'
+        'rtsp_url = "rtsp://operator:hunter2@192.168.0.182:554/video/stream1"\n'
         'srt_host = "srt://10.0.0.5:5000?passphrase=topsecret&latency=125"'
     )
     assert "hunter2" not in out
     assert "topsecret" not in out
     # Everything that is not the credential survives, or the dump stops being
     # useful for diagnosing the connection it describes.
-    assert "192.168.0.182:554/profile2/media.smp" in out
+    assert "192.168.0.182:554/video/stream1" in out
     assert "latency=125" in out
 
 
@@ -426,7 +426,7 @@ _GST_AUTH_ERROR = (
     "2026-09-12 10:04:11 [ERROR] openfollow.runtime.receiver_bus: GStreamer error: "
     "Unauthorized (gstrtspsrc.c(7469): gst_rtspsrc_send (): "
     "/GstPipeline:rtsp-sink/GstRTSPSrc:rtspsrc: Could not open resource for reading "
-    "rtsp://operator:hunter2@192.168.0.182:554/profile2/media.smp)"
+    "rtsp://operator:hunter2@192.168.0.182:554/video/stream1)"
 )
 
 
@@ -435,7 +435,7 @@ def test_redact_log_line_strips_a_credential_from_a_gstreamer_error() -> None:
     assert "hunter2" not in out
     assert "operator:" not in out
     # The line has to stay diagnosable: host, path and reason all survive.
-    assert "rtsp://192.168.0.182:554/profile2/media.smp" in out
+    assert "rtsp://192.168.0.182:554/video/stream1" in out
     assert "Unauthorized" in out
 
 
@@ -664,7 +664,7 @@ def test_collect_recent_failures_redacts_credentials_across_every_log_surface() 
     joined = "\n".join(rows)
     assert "hunter2" not in joined
     assert "topsecret" not in joined
-    assert joined.count("192.168.0.182:554/profile2/media.smp") == 2
+    assert joined.count("192.168.0.182:554/video/stream1") == 2
 
 
 def test_collect_recent_failures_redacts_signatures_in_worker_traceback() -> None:
@@ -833,10 +833,13 @@ def test_collect_recent_failures_extract_window_label_is_source_aware() -> None:
         lambda: ("journalctl", ["[INFO] ok"]),
         lambda: ("in-memory ring buffer (journalctl unavailable)", ["[ERROR] boom"]),
     )
-    joined = "\n".join(rows)
-    assert "last 24h" not in joined
-    assert "this process (ring buffer)" in joined
-    assert "source: in-memory ring buffer (journalctl unavailable)" in joined
+    # Anchored to the extract's own header line: the section carries other
+    # windows (the kernel extract has its own), and matching the phrase
+    # anywhere made this fail on an unrelated addition.
+    label = next(line for line in rows if line.strip().startswith("Failure extract"))
+    assert "last 24h" not in label
+    assert "this process (ring buffer)" in label
+    assert "source: in-memory ring buffer (journalctl unavailable)" in label
 
 
 def test_collect_recent_failures_failure_extract_empty_window() -> None:
@@ -2310,6 +2313,58 @@ def test_collect_system_health_with_temperatures(monkeypatch) -> None:
     assert "cpu=42.5°C" in joined
 
 
+def test_system_health_unlabelled_sensors_read_as_readings(monkeypatch) -> None:
+    """A Pi reports one unlabelled entry per chip, so the chip name in the
+    brackets is the only name there is. Standing an "n/a" where the label
+    would go reads as a failed lookup beside a perfectly good temperature."""
+    from collections import namedtuple
+
+    import psutil
+
+    Temp = namedtuple("Temp", ["label", "current", "high", "critical"])
+    Fan = namedtuple("Fan", ["label", "current"])
+    monkeypatch.setattr(
+        psutil,
+        "sensors_temperatures",
+        lambda: {"cpu_thermal": [Temp(label="", current=63.4, high=110, critical=110)]},
+        raising=False,
+    )
+    monkeypatch.setattr(psutil, "sensors_fans", lambda: {"pwmfan": [Fan(label="", current=5711)]}, raising=False)
+    rows = diag.collect_system_health()
+    joined = "\n".join(rows)
+
+    assert "n/a" not in joined
+    assert any(r.startswith("  temp[cpu_thermal]") and r.rstrip().endswith("63.4\u00b0C") for r in rows)
+    assert any(r.startswith("  fans[pwmfan]") and r.rstrip().endswith("5711 rpm") for r in rows)
+
+
+def test_system_health_keeps_a_label_where_the_chip_reports_one(monkeypatch) -> None:
+    """Multi-core x86 chips label each reading, and those names distinguish
+    entries the chip name cannot - dropping them unconditionally would merge
+    several readings into one indistinguishable list."""
+    from collections import namedtuple
+
+    import psutil
+
+    Temp = namedtuple("Temp", ["label", "current", "high", "critical"])
+    monkeypatch.setattr(
+        psutil,
+        "sensors_temperatures",
+        lambda: {
+            "coretemp": [
+                Temp(label="Core 0", current=42.5, high=80, critical=90),
+                Temp(label="Core 1", current=44.0, high=80, critical=90),
+            ]
+        },
+        raising=False,
+    )
+    rows = diag.collect_system_health()
+    line = next(r for r in rows if r.startswith("  temp[coretemp]"))
+
+    assert "Core 0=42.5\u00b0C" in line
+    assert "Core 1=44.0\u00b0C" in line
+
+
 def test_collect_system_health_temperatures_empty(monkeypatch) -> None:
     """``sensors_temperatures()`` returning an empty dict (Linux
     container / VM with no sensor exposure) and the macOS no-attr
@@ -3296,8 +3351,9 @@ def _stats(**overrides: Any) -> dict[str, Any]:
         },
         "playback": {
             "frame_count_total": 100,
-            "effective_fps": 59.9,
-            "recent_effective_fps": 59.8,
+            "avg_frame_ms": 1.5,
+            "recent_avg_frame_ms": 1.4,
+            "slow_frame_threshold_ms": 20.0,
             "recent_slow_frame_percent": 0.1,
             "seconds_since_last_frame": 0.01,
             "stale_after_s": 1.0,
@@ -3319,6 +3375,22 @@ def _stats(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+def test_runtime_state_reports_frame_work_not_a_throughput_rate() -> None:
+    """``effective_fps`` divides the frame count by summed frame *work* time, so a
+    loop that idles between ticks publishes a figure far above the rate it runs
+    at (a 1.5 ms frame reads as ~667 fps on a 60 Hz tick). Printing it beside the
+    frame count invites the reader to take it as the frame rate."""
+    stats = _stats()
+    stats["playback"] = dict(stats["playback"], avg_frame_ms=1.5, recent_avg_frame_ms=1.4)
+    rows = diag.collect_runtime_state(diag.DiagnosticsProviders(runtime_stats=lambda: stats))
+    line = next(row for row in rows if "frame work" in row)
+
+    assert "1.5 ms avg" in line
+    assert "recent 1.4 ms" in line
+    assert "over 20.0 ms" in line  # the published slow threshold, never a literal
+    assert "fps" not in "\n".join(row for row in rows if "Frame loop" not in row and "source framerate" not in row)
 
 
 def test_collect_runtime_state_reports_not_wired() -> None:
@@ -4167,6 +4239,437 @@ def test_collect_source_reachability_names_an_unregistered_source_type() -> None
     assert "not a registered video input" in rows[1]
 
 
+# ---------------------------------------------------------------------------
+# Local probes: capability, models, provenance, throttling, kernel log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("throttled=0x0", "none (no under-voltage or throttling, now or since boot)"),
+        ("throttled=0x1", "0x1 - under-voltage NOW"),
+        ("throttled=0x80000", "0x80000 - soft temperature limit has occurred since boot"),
+    ],
+)
+def test_decode_throttled_names_the_flags(raw: str, expected: str) -> None:
+    """``throttled=0x50005`` is not something an operator reads, and it is the
+    answer to the freezes and dropped USB devices an inadequate supply causes."""
+    assert diag.decode_throttled(raw) == expected
+
+
+def test_decode_throttled_separates_live_flags_from_latched_ones() -> None:
+    """The high bits latch since boot, which is what an intermittent fault
+    leaves behind once the symptom has passed."""
+    decoded = diag.decode_throttled("throttled=0x50005")
+    assert "under-voltage NOW" in decoded
+    assert "under-voltage has occurred since boot" in decoded
+
+
+@pytest.mark.parametrize("raw", ["garbage", "throttled=", "throttled=0xzz"])
+def test_decode_throttled_rejects_an_unreadable_value(raw: str) -> None:
+    assert "unavailable" in diag.decode_throttled(raw)
+
+
+def test_decode_throttled_reports_an_unknown_bit_without_inventing_a_meaning() -> None:
+    assert diag.decode_throttled("throttled=0x100") == "0x100 - no known flag set"
+
+
+def test_collect_throttle_state_is_unavailable_without_vcgencmd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every probe has to degrade off-platform; there is no vcgencmd on macOS."""
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (-1, "[unavailable: vcgencmd not found]"))
+    assert "unavailable" in diag._collect_throttle_state()
+
+
+def test_collect_throttle_state_wraps_a_bare_failure_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (1, "VCHI initialization failed"))
+    assert diag._collect_throttle_state() == "[unavailable: VCHI initialization failed]"
+
+
+def test_describe_file_reports_size_and_mtime(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text("x" * 42)
+    described = diag.describe_file(target)
+    assert described.startswith("42 B, modified ")
+
+
+def test_describe_file_reports_why_it_cannot_be_read(tmp_path: Path) -> None:
+    assert "unavailable" in diag.describe_file(tmp_path / "absent.toml")
+
+
+def _capability_verdicts(rows: list[str]) -> dict[str, str]:
+    """Parse the input table out of the section, the way a reader reads it."""
+    verdicts: dict[str, str] = {}
+    for row in rows[rows.index("  Video inputs:") + 1 :]:
+        if not row.startswith("    "):
+            break
+        input_id, _, state = row.strip().partition(" ")
+        verdicts[input_id] = state.strip()
+    return verdicts
+
+
+def test_collect_video_capability_gives_every_input_a_definite_verdict() -> None:
+    """ "NDI is not in the picker" and "NDI is broken" look identical from a
+    screenshot, because the picker hides an unavailable backend.
+
+    Asserted by parsing the table, not by substring: "available" is a
+    substring of "unavailable", so the obvious phrasing of this check passes
+    whatever the collector produced.
+    """
+    from openfollow.video.inputs import get_registry
+
+    verdicts = _capability_verdicts(diag.collect_video_capability())
+    assert set(verdicts) == set(get_registry())
+    for input_id, state in verdicts.items():
+        assert state == "available" or state.startswith("unavailable - "), (input_id, state)
+
+
+def test_collect_video_capability_carries_the_plugins_own_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unavailable backend with no reason sends the reader back to the
+    source they could not read in the first place."""
+    from openfollow.video.inputs import get_registry
+
+    monkeypatch.setattr(
+        get_registry()["rtsp"],
+        "is_available",
+        classmethod(lambda cls: (False, "gst-plugin-rtsp is not installed")),
+    )
+    verdicts = _capability_verdicts(diag.collect_video_capability())
+    assert verdicts["rtsp"] == "unavailable - gst-plugin-rtsp is not installed"
+
+
+def test_collect_video_capability_survives_a_plugin_that_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openfollow.video.inputs import get_registry
+
+    plugin = get_registry()["rtsp"]
+    monkeypatch.setattr(plugin, "is_available", classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("boom"))))
+    joined = "\n".join(diag.collect_video_capability())
+    assert "is_available raised" in joined
+
+
+def test_collect_video_capability_reports_an_unreadable_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    import openfollow.video.inputs as inputs_module
+
+    monkeypatch.setattr(inputs_module, "get_registry", lambda: (_ for _ in ()).throw(RuntimeError("registry gone")))
+    assert "input registry" in diag.collect_video_capability()[0]
+
+
+def test_collect_detection_models_lists_what_is_on_disk(tmp_path: Path) -> None:
+    """The storage breakdown reports the directory's size; "detection will not
+    start" is a question about which model is in it."""
+    (tmp_path / "yolo26n.onnx").write_bytes(b"x" * 10)
+    (tmp_path / "notes.txt").write_text("ignored")
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": ""})
+    )
+    joined = "\n".join(rows)
+    assert "yolo26n.onnx" in joined
+    assert "notes.txt" not in joined
+
+
+def test_collect_detection_models_reports_an_empty_store(tmp_path: Path) -> None:
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": ""})
+    )
+    assert any("[none present]" in row for row in rows)
+
+
+def test_collect_detection_models_reports_an_unwired_provider() -> None:
+    assert "not applicable" in diag._collect_detection_models(diag.DiagnosticsProviders())[0]
+    assert "not applicable" in diag._collect_detection_models(None)[0]
+
+
+def test_collect_detection_models_survives_a_raising_provider() -> None:
+    def _boom() -> str:
+        raise RuntimeError("storage exploded")
+
+    rows = diag._collect_detection_models(diag.DiagnosticsProviders(detection_models_dir=_boom))
+    assert "storage exploded" in rows[0]
+
+
+def test_config_provenance_reports_each_file(tmp_path: Path) -> None:
+    """Answers whether a save landed, and whether the station is still on the
+    image defaults - neither of which the dump itself can show."""
+    config = tmp_path / "config.toml"
+    config.write_text("x = 1")
+    rows = diag._collect_config_provenance(
+        diag.DiagnosticsProviders(config_file_paths=lambda: [str(config), str(tmp_path / "markers.toml")])
+    )
+    joined = "\n".join(rows)
+    assert str(config) in joined
+    assert "5 B, modified " in joined
+    assert "unavailable" in joined  # the absent catalog
+
+
+def test_config_provenance_is_absent_when_unwired() -> None:
+    assert diag._collect_config_provenance(diag.DiagnosticsProviders()) == []
+
+
+def test_config_provenance_survives_a_raising_provider() -> None:
+    def _boom() -> list[str]:
+        raise RuntimeError("paths exploded")
+
+    rows = diag._collect_config_provenance(diag.DiagnosticsProviders(config_file_paths=_boom))
+    assert "paths exploded" in rows[1]
+
+
+def test_kernel_extract_keeps_only_hardware_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unit's own journal cannot show these, so a failing supply or a USB
+    device dropping off the bus reads as an unexplained application fault."""
+    monkeypatch.setattr(
+        diag,
+        "_run",
+        lambda *_a, **_k: (
+            0,
+            "kernel: Under-voltage detected! (0x50005)\n"
+            "kernel: usb 1-1: USB disconnect, device number 4\n"
+            "kernel: random: crng init done\n",
+        ),
+    )
+    rows = diag.collect_kernel_extract()
+    joined = "\n".join(rows)
+    assert "Under-voltage detected" in joined
+    assert "USB disconnect" in joined
+    assert "crng init done" not in joined
+
+
+def test_kernel_extract_catches_the_pi5_undervoltage_spelling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verbatim from a Pi 5 on a failing PSU. hwmon writes "Undervoltage" with
+    no hyphen where the Pi 4 firmware path writes "Under-voltage", so a filter
+    carrying one spelling reports a browning-out board as a quiet log."""
+    monkeypatch.setattr(
+        diag,
+        "_run",
+        lambda *_a, **_k: (
+            0,
+            "kernel: hwmon hwmon3: Undervoltage detected!\n"
+            "kernel: hwmon hwmon3: Voltage normalised\n"
+            "kernel: random: crng init done\n",
+        ),
+    )
+    rows = diag.collect_kernel_extract()
+    joined = "\n".join(rows)
+
+    assert "Undervoltage detected!" in joined
+    assert "Voltage normalised" in joined  # one dip vs a board browning out
+    assert "crng init done" not in joined
+    assert "[none]" not in joined
+
+
+def test_kernel_grep_pattern_is_case_insensitive_on_its_own() -> None:
+    """journalctl only infers case-insensitivity for an all-lowercase pattern,
+    and ours is not - so the flag has to travel inside the pattern or the
+    journal-side filter silently disagrees with the Python-side one."""
+    assert diag._KERNEL_GREP.startswith("(?i)")
+    assert diag._KERNEL_LINE_RE.search("HWMON: UNDERVOLTAGE DETECTED!") is not None
+
+
+def test_kernel_extract_reports_a_quiet_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, "kernel: nothing interesting\n"))
+    assert any("[none]" in row for row in diag.collect_kernel_extract())
+
+
+def test_kernel_extract_keeps_the_newest_lines_and_reads_forwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """journalctl hands back newest-first, so capping with the tail of that
+    list keeps the OLDEST matches and hides what is happening now - on a board
+    browning out continuously the extract froze 45 minutes in the past."""
+    newest_first = [f"kernel: hwmon hwmon3: Undervoltage detected! (minute {n})" for n in range(120, 0, -1)]
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, "\n".join(newest_first) + "\n"))
+    rows = diag.collect_kernel_extract()
+    shown = [r for r in rows if "Undervoltage" in r]
+
+    assert len(shown) == diag._KERNEL_EXTRACT_MAX_LINES
+    assert "(minute 120)" in shown[-1]  # the newest survives the cap
+    assert f"(minute {120 - diag._KERNEL_EXTRACT_MAX_LINES + 1})" in shown[0]
+    assert "(minute 1)" not in "\n".join(shown)  # the oldest is what gets dropped
+    assert any(f"{120 - diag._KERNEL_EXTRACT_MAX_LINES} earlier matching line(s)" in r for r in rows)
+
+
+def test_kernel_extract_asks_journalctl_for_newest_first() -> None:
+    """The cap above is only correct against a known order, and ``-n`` alone
+    does not pin one."""
+    seen: list[list[str]] = []
+
+    def _capture(argv: list[str], **_k: object) -> tuple[int, str]:
+        seen.append(argv)
+        return 0, ""
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(diag, "_run", _capture):
+        diag.collect_kernel_extract()
+    assert "-r" in seen[0]
+
+
+def test_kernel_extract_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A station that has been browning out for a day would otherwise paste
+    thousands of identical lines into the bundle."""
+    noisy = "\n".join(f"kernel: Under-voltage detected! ({n})" for n in range(200))
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, noisy))
+    rows = diag.collect_kernel_extract()
+    assert len(rows) == diag._KERNEL_EXTRACT_MAX_LINES + 3  # blank, header, lines, "N earlier"
+    assert "160 earlier matching line(s) not shown" in rows[-1]
+
+
+def test_kernel_extract_is_unavailable_without_journalctl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (-1, "[unavailable: journalctl not found]"))
+    assert "unavailable" in "\n".join(diag.collect_kernel_extract())
+
+
+def test_kernel_extract_redacts_a_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        diag,
+        "_run",
+        lambda *_a, **_k: (0, "kernel: USB disconnect while rtsp://u:pw@cam/s was open"),
+    )
+    assert "pw" not in "\n".join(diag.collect_kernel_extract()).replace("no-pw", "")
+
+
+def test_installed_package_version_reports_a_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, openfollow.__version__))
+    assert diag._installed_package_version(1.0) == f"{openfollow.__version__} installed, and running"
+
+
+def test_installed_package_version_flags_an_unrestarted_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two part company the moment an update installs and the service is
+    not restarted, and every other line then describes the old build."""
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, "9.9.9"))
+    reported = diag._installed_package_version(1.0)
+    assert "MISMATCH" in reported
+    # Phrased as the likely cause rather than asserted as the only one: a
+    # half-finished install or a hand-placed wheel looks the same from here.
+    assert "without a service restart" in reported
+
+
+def test_installed_package_version_handles_a_source_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: None)
+    assert "not a .deb install" in diag._installed_package_version(1.0)
+
+
+def test_collect_throttle_state_decodes_a_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, "throttled=0x50005"))
+    assert "under-voltage NOW" in diag._collect_throttle_state()
+
+
+def test_collect_video_capability_reports_gstreamer_being_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The input table still renders; only the element probe is lost."""
+    import gi
+
+    monkeypatch.setattr(gi, "require_version", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("no Gst")))
+    rows = diag.collect_video_capability()
+    joined = "\n".join(rows)
+    assert "Video inputs:" in joined
+    assert "GStreamer elements: [unavailable" in joined
+
+
+def test_collect_detection_models_reports_an_unreadable_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _boom(self: Path, _pattern: str) -> Any:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "glob", _boom)
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": ""})
+    )
+    assert "Permission denied" in rows[-1]
+
+
+@pytest.mark.parametrize(
+    ("installed", "running"),
+    [
+        ("0.4.2~rc3", "0.4.2rc3"),  # build-deb.sh rewrites rc for Debian's sort order
+        ("0.4.2~b1", "0.4.2b1"),
+        ("1:0.4.2", "0.4.2"),  # an epoch is Debian's alone
+        ("0.4.2", "0.4.2"),
+    ],
+)
+def test_installed_package_version_accepts_the_debian_spelling(
+    monkeypatch: pytest.MonkeyPatch, installed: str, running: str
+) -> None:
+    """Every pre-release install reported a false MISMATCH: the wheel says
+    ``0.4.2rc3`` and the package it was built into says ``0.4.2~rc3``."""
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (0, installed))
+    monkeypatch.setattr(diag.openfollow, "__version__", running)
+    assert "MISMATCH" not in diag._installed_package_version(1.0)
+
+
+def test_installed_package_version_separates_a_probe_failure_from_a_source_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run`` folds a missing binary, a timeout and a launch error into one
+    sentinel, so a budget-exhausted probe on a real .deb station reported
+    itself as a source checkout."""
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (-1, "[unavailable: timed out after 0.0s]"))
+    reported = diag._installed_package_version(0.0)
+    assert "not a .deb install" not in reported
+    assert "installed version unavailable" in reported
+
+
+def test_installed_package_version_reports_an_unpackaged_station(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (1, "dpkg-query: no packages found matching openfollow"))
+    assert "not installed as a .deb" in diag._installed_package_version(1.0)
+
+
+def test_installed_package_version_skips_the_probe_without_dpkg(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _must_not_run(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("dpkg-query must not be invoked when it is absent")
+
+    monkeypatch.setattr(diag.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(diag, "_run", _must_not_run)
+    assert "not a .deb install" in diag._installed_package_version(1.0)
+
+
+def test_collect_detection_models_does_not_hang_on_a_stale_mount(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The storage section bounds this same operator-configured path: a glob
+    on a stale mount blocks the WSGI worker in D-state, and repeated downloads
+    take the web UI down with it."""
+    monkeypatch.setattr(diag, "_bounded_probe", lambda _fn, _timeout, timeout_value: timeout_value)
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": ""})
+    )
+    assert "listing timed out (stale mount?)" in rows[-1]
+
+
+def test_kernel_extract_filters_in_the_journal_not_in_this_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A browning-out Pi logs continuously; reading a day of kernel messages
+    to filter them here timed out having produced nothing, and spent the
+    section's whole budget doing it."""
+    seen: dict[str, Any] = {}
+
+    def _capture(cmd: list[str], **kwargs: Any) -> tuple[int, str]:
+        seen["cmd"] = cmd
+        seen["timeout"] = kwargs.get("timeout_s")
+        return 0, ""
+
+    monkeypatch.setattr(diag, "_run", _capture)
+    diag.collect_kernel_extract(timeout_s=3.0)
+    assert "--grep" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--grep") + 1] == diag._KERNEL_GREP
+    assert "-n" in seen["cmd"]
+    assert seen["timeout"] == 3.0
+
+
+def test_recent_failures_uses_the_injected_kernel_collector() -> None:
+    """Injected so the bundle can clamp it to what is left of the budget - a
+    fixed timeout here pushes the later sections into "[skipped]" on exactly
+    the struggling station whose kernel log is worth reading."""
+    rows = diag.collect_recent_failures(
+        diag.DiagnosticsProviders(),
+        lambda: ("journalctl", ["[INFO] ok"]),
+        None,
+        lambda: ["  KERNEL SECTION"],
+    )
+    assert "  KERNEL SECTION" in rows
+
+
 def test_describe_address_reachability_prefers_the_lowest_metric(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4216,3 +4719,55 @@ def test_read_default_routes_orders_by_metric(tmp_path: Path) -> None:
 def test_read_routes_skips_a_row_with_an_unreadable_metric(tmp_path: Path) -> None:
     path = _route_file(tmp_path, "eth0\t00000000\t01B2A8C0\t0003\t0\t0\tNOTANUM\t00000000\t0\t0\t0\n")
     assert diag.read_routes(path) == []
+
+
+def test_collect_detection_models_flags_a_configured_model_that_is_absent(tmp_path: Path) -> None:
+    """Found on a real station: the config named a model no longer on disk.
+    Listing the directory leaves the reader to cross-reference section C, and
+    this is the "why will detection not start" answer, so it is stated."""
+    (tmp_path / "yolo26n.onnx").write_bytes(b"x")
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": "yolov8n.onnx"})
+    )
+    assert any("yolov8n.onnx is NOT in this directory" in row for row in rows)
+
+
+def test_collect_detection_models_marks_the_configured_model(tmp_path: Path) -> None:
+    (tmp_path / "yolo26n.onnx").write_bytes(b"x")
+    rows = diag._collect_detection_models(
+        diag.DiagnosticsProviders(detection_models_dir=lambda: {"dir": str(tmp_path), "configured": "yolo26n.onnx"})
+    )
+    assert any(row.strip().startswith("yolo26n.onnx") and "<- configured" in row for row in rows)
+    assert not any("NOT in this directory" in row for row in rows)
+
+
+def test_kernel_extract_reads_no_matches_as_quiet_not_broken(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``journalctl --grep`` exits non-zero with no output when nothing
+    matched - the healthy station. Reporting that as a failed probe, with an
+    empty reason, said the opposite of the truth on every clean box."""
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (1, ""))
+    rows = diag.collect_kernel_extract()
+    assert any("[none]" in row for row in rows)
+    assert not any("unavailable" in row for row in rows)
+
+
+def test_kernel_extract_still_reports_a_real_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diag, "_run", lambda *_a, **_k: (1, "Failed to open journal: Permission denied"))
+    assert "Permission denied" in "\n".join(diag.collect_kernel_extract())
+
+
+def test_collect_network_interfaces_separates_a_long_name_from_its_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A USB adapter's name is longer than the column, and a bare width ran it
+    into the next field: ``enx9c69d3af4e98isup=True``."""
+    import psutil
+
+    monkeypatch.setattr(
+        psutil,
+        "net_if_stats",
+        lambda: {"enx9c69d3af4e98": SimpleNamespace(isup=True, speed=1000, mtu=1500, duplex=2)},
+    )
+    monkeypatch.setattr(psutil, "net_if_addrs", lambda: {})
+    rows = diag.collect_network_interfaces(_route_file(tmp_path, ""))
+    assert "enx9c69d3af4e98 isup=True" in rows[0]

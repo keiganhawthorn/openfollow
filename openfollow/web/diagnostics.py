@@ -181,6 +181,11 @@ class DiagnosticsProviders:
     # when this input dials nothing (a local camera, a listener, discovery).
     source_endpoint: Callable[[], dict[str, Any] | None] | None = None
 
+    # Absolute paths of the files the station's configuration is read from.
+    config_file_paths: Callable[[], list[str]] | None = None
+    # ``{"dir": <resolved <storage>/models>, "configured": <model filename>}``.
+    detection_models_dir: Callable[[], dict[str, str]] | None = None
+
     config_redacted_toml: Callable[[], str] | None = None
     config_diff_from_defaults: Callable[[], list[str]] | None = None
 
@@ -267,6 +272,68 @@ def _run(
     else:
         out = result.stderr or ""
     return result.returncode, out.rstrip()
+
+
+# Elements no single input plugin owns, each named with what stops working
+# when it is missing. Universally present ones (queue, videoconvert) are left
+# out: listing what cannot plausibly be absent buries what can.
+_SHARED_GST_ELEMENTS: tuple[tuple[str, str], ...] = (
+    ("gtksink", "video output"),
+    ("appsink", "detection, preview and wizard snapshots"),
+    ("valve", "snapshot gating"),
+    ("decodebin", "SRT / RTSP / RTP decode"),
+    ("rtpjitterbuffer", "RTP input"),
+    ("jpegenc", "wizard snapshots and the web preview"),
+    ("imagefreeze", "still images in the Media Gallery"),
+    ("webpdec", "WebP media in the Media Gallery"),
+    ("videotestsrc", "the No Signal placeholder"),
+)
+
+# Decoders, in the order the pipeline prefers them. Absence is not a fault -
+# which one is present is the answer to "why is this Pi dropping frames".
+_DECODER_ELEMENTS: tuple[str, ...] = ("v4l2h264dec", "v4l2h265dec", "avdec_h264", "openh264dec")
+
+# ``vcgencmd get_throttled`` bit meanings. The low bits are live, the high
+# ones latch since boot - an operator chasing an intermittent freeze needs the
+# latched ones, which is the whole reason to read this.
+_THROTTLE_BITS: tuple[tuple[int, str], ...] = (
+    (0, "under-voltage NOW"),
+    (1, "ARM frequency capped NOW"),
+    (2, "currently throttled"),
+    (3, "soft temperature limit active"),
+    (16, "under-voltage has occurred since boot"),
+    (17, "ARM frequency capping has occurred since boot"),
+    (18, "throttling has occurred since boot"),
+    (19, "soft temperature limit has occurred since boot"),
+)
+
+
+def describe_file(path: Path) -> str:
+    """``<size> B, modified <when>`` for a file, or why it cannot be read."""
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return f"[unavailable: {exc.strerror or exc}]"
+    when = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+    return f"{stat.st_size} B, modified {when}"
+
+
+def decode_throttled(raw: str) -> str:
+    """Render a ``vcgencmd get_throttled`` reading as the flags it stands for.
+
+    ``throttled=0x50005`` is not something an operator reads, and it is the
+    answer to the freezes and dropped USB devices that an undervolted supply
+    causes.
+    """
+    _, _, value = raw.strip().partition("=")
+    try:
+        bits = int(value, 16)
+    except ValueError:
+        return f"[unavailable: unrecognised reading {raw.strip()!r}]"
+    if bits == 0:
+        return "none (no under-voltage or throttling, now or since boot)"
+    flags = [label for bit, label in _THROTTLE_BITS if bits & (1 << bit)]
+    return f"{value} - {'; '.join(flags)}" if flags else f"{value} - no known flag set"
 
 
 # ---------------------------------------------------------------------------
@@ -405,10 +472,13 @@ def collect_runtime_state(p: DiagnosticsProviders) -> list[str]:
     rows.append("  Frame loop:")
     rows.append(f"    state                 {clock}")
     rows.append(f"    frames total          {playback.get('frame_count_total', 0)}")
+    # Not a frame rate: the published fps is work-time throughput, so a loop idling
+    # between frames reads far above the tick it actually runs at.
     rows.append(
-        f"    effective fps         {float(playback.get('effective_fps', 0.0) or 0.0):.1f} "
-        f"(recent {float(playback.get('recent_effective_fps', 0.0) or 0.0):.1f}), "
-        f"slow {float(playback.get('recent_slow_frame_percent', 0.0) or 0.0):.1f}%"
+        f"    frame work            {float(playback.get('avg_frame_ms', 0.0) or 0.0):.1f} ms avg "
+        f"(recent {float(playback.get('recent_avg_frame_ms', 0.0) or 0.0):.1f} ms), "
+        f"slow {float(playback.get('recent_slow_frame_percent', 0.0) or 0.0):.1f}% "
+        f"over {float(playback.get('slow_frame_threshold_ms', 0.0) or 0.0):.1f} ms"
     )
 
     tracking = stats.get("tracking") or {}
@@ -836,6 +906,25 @@ def redact_config_secrets(toml_text: str) -> str:
     return "\n".join(out)
 
 
+def _collect_config_provenance(p: DiagnosticsProviders) -> list[str]:
+    """Which files this configuration came from, and when they last changed.
+
+    Answers two questions the dump itself cannot: whether a save actually
+    landed, and whether the station is still running the image defaults.
+    """
+    if p.config_file_paths is None:
+        return []
+    paths, err = _safely_value(p.config_file_paths, "config_file_paths", [])
+    if err is not None:
+        return ["", f"  Config files: {err}"]
+    rows = ["", "  Config files:"]
+    for raw in paths or []:
+        path = Path(str(raw))
+        rows.append(f"    {path.name:<18}{path}")
+        rows.append(f"    {'':<18}{describe_file(path)}")
+    return rows
+
+
 def collect_config(p: DiagnosticsProviders) -> list[str]:
     rows: list[str] = []
     if p.config_redacted_toml is None:
@@ -850,6 +939,7 @@ def collect_config(p: DiagnosticsProviders) -> list[str]:
     for line in text.splitlines():
         rows.append(f"  {line}")
     rows.append("  ----- end effective config -----")
+    rows.extend(_collect_config_provenance(p))
     if p.config_diff_from_defaults is not None:
         rows.append("")
         rows.append("  Diff vs defaults:")
@@ -1086,10 +1176,80 @@ def annotate_log_discontinuities(lines: list[str]) -> list[str]:
     return out
 
 
+# Kernel messages worth surfacing beside the application log. The unit's own
+# journal cannot show them, so a failing supply, a USB device dropping off the
+# bus or the OOM killer reads as an unexplained application fault.
+# Spelling varies by driver, not by severity: a Pi 4 logs "Under-voltage
+# detected!" from the firmware path and a Pi 5 "Undervoltage detected!" from
+# hwmon, so an exact phrase silently exempts whichever board it was not copied
+# from. The recovery line earns its place by separating one dip from a board
+# browning out continuously.
+_KERNEL_PATTERNS: tuple[str, ...] = (
+    "under-?voltage",
+    "voltage normali[sz]ed",
+    "over-?current",
+    "USB disconnect",
+    "Out of memory",
+    "oom-kill",
+)
+# Handed to ``journalctl --grep`` so the match happens in the journal rather
+# than by buffering a day of kernel messages through this process - a browning
+# out Pi logs continuously, and the unfiltered read timed out having produced
+# nothing while spending the section's whole budget. ``(?i)`` travels with the
+# pattern because journalctl only infers case-insensitivity for an all-lowercase
+# one, which these are not.
+_KERNEL_GREP = "(?i)" + "|".join(_KERNEL_PATTERNS)
+_KERNEL_LINE_RE = re.compile("|".join(_KERNEL_PATTERNS), re.IGNORECASE)
+_KERNEL_EXTRACT_TIMEOUT_S = 6.0
+_KERNEL_EXTRACT_MAX_LINES = 40
+
+
+def collect_kernel_extract(timeout_s: float = _KERNEL_EXTRACT_TIMEOUT_S) -> list[str]:
+    """Hardware-level events from the kernel log, filtered and bounded."""
+    rc, out = _run(
+        [
+            "journalctl",
+            "-k",
+            "--since",
+            "-24h",
+            "--no-pager",
+            "-o",
+            "short",
+            "--grep",
+            _KERNEL_GREP,
+            # ``-r`` pins newest-first rather than inheriting whatever order
+            # ``-n`` yields, so the cap below can keep the right end.
+            "-r",
+            "-n",
+            str(_KERNEL_EXTRACT_MAX_LINES * 4),
+        ],
+        timeout_s=timeout_s,
+    )
+    if rc != 0 and out.strip():
+        return ["", f"  Kernel log (last 24h): {out if out.startswith('[unavailable') else f'[unavailable: {out}]'}"]
+    if rc != 0:
+        # ``journalctl --grep`` exits non-zero with no output when nothing
+        # matched, which is the healthy station - reporting that as a broken
+        # probe (and with an empty reason) said the opposite of the truth.
+        return ["", "  Kernel log (last 24h, power / USB / OOM only):", "    [none]"]
+    matched = [line for line in out.splitlines() if _KERNEL_LINE_RE.search(line)]
+    rows = ["", "  Kernel log (last 24h, power / USB / OOM only):"]
+    if not matched:
+        rows.append("    [none]")
+        return rows
+    dropped = len(matched) - _KERNEL_EXTRACT_MAX_LINES
+    for line in reversed(matched[:_KERNEL_EXTRACT_MAX_LINES]):
+        rows.append(f"    {redact_log_line(line)}")
+    if dropped > 0:
+        rows.append(f"    [... {dropped} earlier matching line(s) not shown]")
+    return rows
+
+
 def collect_recent_failures(
     p: DiagnosticsProviders,
     log_collector: Callable[[], tuple[str, list[str]]],
     failure_collector: Callable[[], tuple[str, list[str]]] | None = None,
+    kernel_collector: Callable[[], list[str]] | None = None,
 ) -> list[str]:
     """Collect recent log lines and optionally a severity-filtered extract.
 
@@ -1129,6 +1289,7 @@ def collect_recent_failures(
             else:
                 rows.append("  [no WARNING/ERROR/CRITICAL lines in window]")
             rows.append("  ----- end failure extract -----")
+    rows.extend((kernel_collector or collect_kernel_extract)())
     if p.worker_thread_tracebacks is not None:
         rows.append("")
         rows.append("  Last worker-thread tracebacks:")
@@ -1371,6 +1532,93 @@ def collect_runtime_versions(
     rows.append(f"  GTK 3                        {_gtk3_version(cap())}")
     ndi = "present" if importlib.util.find_spec("NDIlib") else "[not present]"
     rows.append(f"  libndi                       {ndi}")
+    rows.append(f"  openfollow package           {_installed_package_version(cap())}")
+    return rows
+
+
+def _normalise_package_version(version: str) -> str:
+    """A Debian version reduced to what compares against a PEP 440 one.
+
+    ``build-deb.sh`` rewrites a pre-release for Debian's sort order - ``rc``
+    becomes ``~rc``, so the wheel's ``0.4.2rc3`` ships as ``0.4.2~rc3`` - and a
+    raw equality then reports every rc build as a mismatch. An epoch is
+    Debian's alone and never appears upstream.
+    """
+    _, _, without_epoch = version.strip().rpartition(":")
+    return (without_epoch or version.strip()).replace("~", "").lower()
+
+
+def _installed_package_version(timeout_s: float) -> str:
+    """The installed ``.deb`` version against the code actually running.
+
+    They part company the moment an update installs and the service is not
+    restarted, and every other line in the bundle then describes the old
+    build while the operator reads the new version number off the release
+    notes.
+    """
+    running = openfollow.__version__
+    if shutil.which("dpkg-query") is None:
+        return f"running {running} (not a .deb install)"
+    rc, out = _run(["dpkg-query", "-W", "-f=${Version}", "openfollow"], timeout_s=timeout_s)
+    if rc != 0:
+        # ``_run`` folds a missing binary, a timeout and a launch error into
+        # one sentinel, and dpkg-query exits non-zero for an unknown package
+        # too. Only the last of those means "not a .deb install", so the rest
+        # report what went wrong rather than asserting a packaging state.
+        if "no packages found" in out.lower():
+            return f"running {running} (openfollow is not installed as a .deb)"
+        return f"running {running} (installed version unavailable: {out})"
+    installed = out.strip()
+    if _normalise_package_version(installed) == _normalise_package_version(running):
+        return f"{installed} installed, and running"
+    return (
+        f"MISMATCH: {installed} installed, {running} running - "
+        "an update that installed without a service restart looks like this"
+    )
+
+
+def collect_video_capability() -> list[str]:
+    """Which video inputs this station can actually offer, and why not.
+
+    The picker hides a backend whose element is missing, so "NDI is not in the
+    list" and "NDI is broken" look identical from a screenshot. Each plugin
+    already answers this for itself through ``is_available`` - this reports
+    what it says rather than keeping a second list that can drift.
+    """
+    rows: list[str] = []
+    try:
+        from openfollow.video.inputs import get_registry  # noqa: PLC0415
+
+        registry = get_registry()
+    except Exception as exc:  # noqa: BLE001
+        return [f"  [unavailable: input registry: {exc!r}]"]
+
+    rows.append("  Video inputs:")
+    for input_id, plugin in sorted(registry.items()):
+        try:
+            available, reason = plugin.is_available()
+        except Exception as exc:  # noqa: BLE001
+            available, reason = False, f"is_available raised: {exc!r}"
+        state = "available" if available else f"unavailable - {reason}"
+        rows.append(f"    {input_id:<14}{state}")
+
+    try:
+        import gi  # noqa: PLC0415
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # noqa: PLC0415
+
+        Gst.init(None)
+    except Exception as exc:  # noqa: BLE001
+        rows.append(f"  GStreamer elements: [unavailable: {exc!r}]")
+        return rows
+
+    rows.append("  Shared GStreamer elements:")
+    for name, used_for in _SHARED_GST_ELEMENTS:
+        present = "present" if Gst.ElementFactory.find(name) else "MISSING"
+        rows.append(f"    {name:<18}{present:<9}({used_for})")
+    found = [name for name in _DECODER_ELEMENTS if Gst.ElementFactory.find(name)]
+    rows.append(f"  Video decoders:       {', '.join(found) if found else 'none of the expected decoders'}")
     return rows
 
 
@@ -1389,7 +1637,7 @@ _DETECTION_DISTRIBUTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
-def collect_detection_stack() -> list[str]:
+def collect_detection_stack(p: DiagnosticsProviders | None = None) -> list[str]:
     rows: list[str] = []
     for dist, _mod in _DETECTION_DISTRIBUTIONS:
         try:
@@ -1405,6 +1653,55 @@ def collect_detection_stack() -> list[str]:
             rows.append(f"  onnxruntime providers        {', '.join(providers)}")
         except Exception as exc:  # noqa: BLE001
             rows.append(f"  onnxruntime providers        [unavailable: {exc!r}]")
+    rows.extend(_collect_detection_models(p))
+    return rows
+
+
+def _list_model_files(directory: Path) -> tuple[list[Path], str | None]:
+    """``(models, error)`` for a storage directory, never raising."""
+    try:
+        return sorted(directory.glob("*.onnx")), None
+    except OSError as exc:
+        return [], str(exc.strerror or exc)
+
+
+def _collect_detection_models(p: DiagnosticsProviders | None) -> list[str]:
+    """The model files actually present in the storage directory.
+
+    The storage breakdown reports that directory's *size*; "detection will not
+    start" is a question about which model is in it and whether the configured
+    one is among them.
+    """
+    if p is None or p.detection_models_dir is None:
+        return ["  models                       [not applicable: storage provider not wired]"]
+    info, err = _safely_value(p.detection_models_dir, "detection_models_dir", {})
+    if err is not None:
+        return [f"  models                       {err}"]
+    info = info or {}
+    directory = Path(str(info.get("dir") or ""))
+    configured = str(info.get("configured") or "")
+    rows = [f"  models directory             {directory}"]
+    # Same hazard the storage section bounds for the same path: an
+    # operator-configured storage_path can be a stale NFS/CIFS/USB mount,
+    # where a glob blocks the WSGI worker in D-state and repeated downloads
+    # take the web UI down with them.
+    listed = _bounded_probe(partial(_list_model_files, directory), _STAT_PROBE_TIMEOUT_S, None)
+    if listed is None:
+        rows.append("  models                       [unavailable: listing timed out (stale mount?)]")
+        return rows
+    entries, error = listed
+    if error is not None:
+        rows.append(f"  models                       [unavailable: {error}]")
+        return rows
+    if not entries:
+        rows.append("  models                       [none present]")
+    for entry in entries:
+        marker = "  <- configured" if entry.name == configured else ""
+        rows.append(f"    {entry.name:<27}{describe_file(entry)}{marker}")
+    if configured and configured not in {entry.name for entry in entries}:
+        # The list alone leaves the reader to cross-reference section C. This
+        # is the "why will detection not start" answer, so it is stated.
+        rows.append(f"  configured model             {configured} is NOT in this directory")
     return rows
 
 
@@ -1756,6 +2053,19 @@ def collect_storage_breakdown(
 # E6. System health ---------------------------------------------------------
 
 
+def _collect_throttle_state() -> str:
+    """Raspberry Pi under-voltage and throttling flags.
+
+    Temperature and fan speed are already here, and neither shows an
+    inadequate supply - which presents as random freezes and USB devices
+    dropping out, not as heat.
+    """
+    rc, out = _run(["vcgencmd", "get_throttled"], timeout_s=2.0)
+    if rc != 0:
+        return out if out.startswith("[unavailable") else f"[unavailable: {out}]"
+    return decode_throttled(out)
+
+
 def collect_system_health() -> list[str]:
     import psutil  # noqa: PLC0415
 
@@ -1765,6 +2075,7 @@ def collect_system_health() -> list[str]:
         f"  boot time (UTC)              {datetime.fromtimestamp(bt, tz=timezone.utc).isoformat(timespec='seconds')}"
     )
     rows.append(f"  uptime                       {(time.time() - bt) / 3600:.1f} h")
+    rows.append(f"  throttling                   {_collect_throttle_state()}")
     # ``sensors_temperatures`` doesn't exist on macOS at all
     # (``AttributeError``); on Linux it can be empty / Permission
     # Denied. Treat all three as the same "unavailable" case.
@@ -1773,9 +2084,14 @@ def collect_system_health() -> list[str]:
         if not temps:
             rows.append("  temperatures                 [unavailable: not exposed by this OS]")
         else:
+            # A Pi exposes one unlabelled reading per chip, so the chip name in
+            # the brackets is the only name there is - a placeholder for the
+            # absent label reads as a failed lookup.
             for label, temp_items in temps.items():
-                vals = ", ".join(f"{i.label or 'n/a'}={i.current:.1f}°C" for i in temp_items)
-                rows.append(f"  temp[{label:<20}] {vals}")
+                vals = ", ".join(
+                    f"{i.label}={i.current:.1f}°C" if i.label else f"{i.current:.1f}°C" for i in temp_items
+                )
+                rows.append(f"  {f'temp[{label}]':<29}{vals}")
     except Exception as exc:  # noqa: BLE001
         rows.append(f"  temperatures                 [unavailable: {exc!r}]")
     try:
@@ -1784,8 +2100,8 @@ def collect_system_health() -> list[str]:
             rows.append("  fans                         [unavailable: not exposed]")
         else:
             for label, fan_items in fans.items():
-                vals = ", ".join(f"{i.label or 'n/a'}={i.current} rpm" for i in fan_items)
-                rows.append(f"  fans[{label:<20}] {vals}")
+                vals = ", ".join(f"{i.label}={i.current} rpm" if i.label else f"{i.current} rpm" for i in fan_items)
+                rows.append(f"  {f'fans[{label}]':<29}{vals}")
     except Exception as exc:  # noqa: BLE001
         rows.append(f"  fans                         [unavailable: {exc!r}]")
     try:
@@ -1896,8 +2212,10 @@ def collect_network_interfaces(route_path: Path | None = None) -> list[str]:
         addrs = {}
         rows.append(f"  [addresses unavailable: net_if_addrs: {exc!r}]")
     for nic, st in stats.items():
+        # A USB adapter's name (enx9c69d3af4e98) is longer than the column, so
+        # a bare width ran it straight into the next field.
         rows.append(
-            f"  {nic:<14}isup={st.isup} speed={st.speed}Mb mtu={st.mtu} "
+            f"  {nic:<14} isup={st.isup} speed={st.speed}Mb mtu={st.mtu} "
             f"duplex={duplex_label.get(int(st.duplex), str(st.duplex))}"
         )
         for addr in addrs.get(nic, ()):
@@ -2412,6 +2730,7 @@ class DiagnosticsBundle:
     c_config: list[str] = field(default_factory=list)
     d_failures: list[str] = field(default_factory=list)
     e1_runtime: list[str] = field(default_factory=list)
+    e1b_video: list[str] = field(default_factory=list)
     e2_detection: list[str] = field(default_factory=list)
     e3_os: list[str] = field(default_factory=list)
     e4_cpu: list[str] = field(default_factory=list)
@@ -2438,6 +2757,7 @@ _BUNDLE_SECTIONS: tuple[tuple[str, str], ...] = (
     ("C. Effective config", "c_config"),
     ("D. Recent failures", "d_failures"),
     ("E1. Runtime / versions", "e1_runtime"),
+    ("E1b. Video capability", "e1b_video"),
     ("E2. Person detection stack", "e2_detection"),
     ("E3. Operating system", "e3_os"),
     ("E4. CPU", "e4_cpu"),
@@ -2502,6 +2822,13 @@ def collect_bundle(
             timeout_s=remaining(_FAILURE_EXTRACT_TIMEOUT_S),
         )
 
+    def kernel_collector_fn() -> list[str]:
+        # Clamped to what is left of the bundle's budget, like the failure
+        # extract beside it: a fixed timeout here pushes the later sections
+        # into "[skipped]" on exactly the struggling station whose kernel log
+        # is worth reading.
+        return collect_kernel_extract(timeout_s=remaining(_KERNEL_EXTRACT_TIMEOUT_S))
+
     # Every section that runs more than one probe takes the remaining budget
     # explicitly; the single-probe ones are bound by the deadline check alone.
     collectors: dict[str, Callable[[], list[str]]] = {
@@ -2512,9 +2839,15 @@ def collect_bundle(
         "a5_source_reach": lambda: collect_source_reachability(p),
         "b_discovery": lambda: collect_discovery(p),
         "c_config": lambda: collect_config(p),
-        "d_failures": lambda: collect_recent_failures(p, log_collector_fn, failure_collector_fn),
+        "d_failures": lambda: collect_recent_failures(
+            p,
+            log_collector_fn,
+            failure_collector_fn,
+            kernel_collector_fn,
+        ),
         "e1_runtime": lambda: collect_runtime_versions(repo_root, budget_s=remaining(_RUNTIME_SECTION_BUDGET_S)),
-        "e2_detection": collect_detection_stack,
+        "e1b_video": collect_video_capability,
+        "e2_detection": lambda: collect_detection_stack(p),
         "e3_os": collect_os,
         "e4_cpu": collect_cpu,
         "e5_memdisk": lambda: collect_memory_disk(extra_paths=extra_storage_paths),

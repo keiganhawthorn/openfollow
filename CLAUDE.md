@@ -44,6 +44,31 @@ See `docs/PROJECT_STRUCTURE.md` for layout.
   or rewrite the sentence. This applies everywhere: code comments, docstrings,
   UI strings, templates, help text, and Markdown.
 
+## Support cases in public artefacts
+
+Issues, pull requests, commit messages, code comments, tests and docs are
+public and permanent. **Never carry a specific operator's details into them.**
+That means no IP addresses, hostnames, station names, stream URLs, ports,
+config dumps or log excerpts taken from a real report, and no wording that
+identifies the report itself ("the bundle from X", a ticket title, a date that
+pins it).
+
+Write the **failure class**, not the case:
+
+- Not "the station was on 192.168.3.5/24 looking for a camera on
+  192.168.1.100", but "a station addressed on one subnet, with the camera on
+  another and no route between them".
+- Not "the 381 kB bundle from that unit", but "a bundle dominated by one
+  repeating reconnect cycle".
+- Where an example address genuinely helps a reader, invent one from the
+  documentation ranges (RFC 5737 `192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24`; RFC 3849 `2001:db8::/32`).
+
+The class is what a reader needs, and it ages better: the next person hitting
+the same fault does not have the same address. Diagnostics bundles attached to
+reports stay in the support channel and are never quoted verbatim in the
+tracker.
+
 ## Commit messages
 
 Use [Conventional Commits](https://www.conventionalcommits.org):
@@ -93,7 +118,7 @@ A code change that skips these standards is incomplete regardless of how clean t
 OpenFollow runs on isolated event / stage LANs with no internet uplink – tracker operators bring a Pi (or laptop) onto a show network that has zero outbound connectivity. The full app, including the web UI, MUST work end-to-end without any outbound network access. Every change must keep this contract:
 
 - **No CDN-loaded JS / CSS / fonts.** No ``unpkg.com``, ``cdn.jsdelivr.net``, ``fonts.googleapis.com``, ``cdnjs.cloudflare.com``, etc. Bundle the asset under [`openfollow/web/static/`](openfollow/web/static/) and reference it via the existing ``/assets/<filename:path>`` route. The poetry-core wheel build already ships the entire static dir.
-- **No outbound HTTP from server-side code at runtime.** Three documented exceptions, none reachable on the data path: (1) the signed-``.deb`` release updater (``runtime/deb_update.py``) fetches releases only from the GitHub repo named in ``update_github_repo``; (2) the detection **model export** action (``/section/detection/export``) shells out to the optional ``export`` extra (ultralytics), which downloads YOLO weights and exports them to ONNX under ``<storage_path>/models``. Export needs the extra installed *and* an uplink, so it only works on a workstation – on an offline show Pi the button is hidden/disabled and operators copy the ``.onnx`` over manually; (3) the background **online-sync worker** (``runtime/online_sync.py``) which, on startup and on IP change, queries an NTP server (``time_sync_server``, to set the clock since a Pi has no RTC) and the same ``update_github_repo`` GitHub Releases API (to surface the update banner). Unlike (1)/(2) it isn't click-gated, but it is config-gated (``auto_time_sync`` / ``auto_update_check``, default on), fails silently when the LAN has no uplink, and never blocks startup or the render path. The clock-set runs through the privilege broker only when the ``system.set_clock`` capability is already passwordless – it never prompts. Anything else (telemetry, analytics, license check, "phone home", remote feature flags) is rejected.
+- **No outbound HTTP from server-side code at runtime.** Four documented exceptions, none reachable on the data path: (1) the signed-``.deb`` release updater (``runtime/deb_update.py``) fetches releases only from the GitHub repo named in ``update_github_repo``; (2) the detection **model export** action (``/section/detection/export``) shells out to the optional ``export`` extra (ultralytics), which downloads YOLO weights and exports them to ONNX under ``<storage_path>/models``. Export needs the extra installed *and* an uplink, so it only works on a workstation – on an offline show Pi the button is hidden/disabled and operators copy the ``.onnx`` over manually; (3) the background **online-sync worker** (``runtime/online_sync.py``) which, on startup and on IP change, queries an NTP server (``time_sync_server``, to set the clock since a Pi has no RTC) and the same ``update_github_repo`` GitHub Releases API (to surface the update banner). Unlike (1)/(2) it isn't click-gated, but it is config-gated (``auto_time_sync`` / ``auto_update_check``, default on), fails silently when the LAN has no uplink, and never blocks startup or the render path. The clock-set runs through the privilege broker only when the ``system.set_clock`` capability is already passwordless – it never prompts; (4) the diagnostics bundle's **video-source reachability probe** (``web/diagnostics.py``, section A5), a single bounded TCP connect to the host the *operator's own* video input is configured to dial, plus a bounded DNS lookup for it. It answers the most common support question there is – whether the station can reach its camera at all – which no amount of local state can. It is operator-click-gated (a bundle download), sends no stream data and reads nothing back, is capped at ~2.5 s total, is never scheduled and never runs at startup or on the render path, and when the resolved address is public rather than LAN the section says so in the output. Anything else (telemetry, analytics, license check, "phone home", remote feature flags) is rejected.
 - **No silent fallback to "online" if a resource is unreachable.** A page that renders fine without its CDN-loaded script but where Save silently no-ops is the worst possible failure mode – the historical example was [`base.tpl`](openfollow/web/templates/base.tpl) loading htmx from ``unpkg.com``: on offline LANs the script never loaded, so every form fell through to a native GET on the current URL and saves silently no-opped. The regression test in [`tests/test_web_server.py`](tests/test_web_server.py) (``test_index_page_uses_locally_bundled_htmx`` + ``test_htmx_static_asset_is_served``) pins the local-asset reference and the asset's content type so this can't quietly revert.
 
 The local LAN is fair game: mDNS-style multicast beacon, peer broadcast, PSN multicast, OSC, RTSP/SRT/RTP/NDI receivers all stay on the show network and are fine. CI runs offline; new external-service dependencies break that gate.

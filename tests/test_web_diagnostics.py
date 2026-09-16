@@ -198,13 +198,13 @@ def test_collect_osc_multicast_joined_group_with_allowlist() -> None:
             "port": 8765,
             "multicast_group": "239.20.20.20",
             "multicast_joined": True,
-            "allowed_sender_ips": ["192.168.1.5", "192.168.1.6"],
+            "allowed_sender_ips": ["198.51.100.5", "192.168.1.6"],
         }
     )
     joined = "\n".join(diag.collect_osc_multicast(p))
     assert "Listener port:              8765" in joined
     assert "239.20.20.20 (joined)" in joined
-    assert "192.168.1.5, 192.168.1.6" in joined
+    assert "198.51.100.5, 192.168.1.6" in joined
 
 
 def test_collect_osc_multicast_join_failed_open_allowlist() -> None:
@@ -3129,27 +3129,36 @@ def _route_file(tmp_path: Path, body: str) -> Path:
 
 @pytest.mark.parametrize(
     ("netmask", "expected"),
-    [("255.255.255.0", 24), ("255.255.0.0", 16), ("255.255.255.255", 32), ("0.0.0.0", 0)],
+    [
+        ("255.255.255.0", 24),
+        ("255.255.0.0", 16),
+        ("255.255.255.255", 32),
+        ("0.0.0.0", 0),
+        # IPv6, which ``ip_network`` refuses in this form at all.
+        ("ffff:ffff:ffff:ffff::", 64),
+        ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 128),
+    ],
 )
-def test_ipv4_prefix_len_converts_dotted_quad(netmask: str, expected: int) -> None:
-    assert diag.ipv4_prefix_len(netmask) == expected
+def test_netmask_prefix_len_handles_both_families(netmask: str, expected: int) -> None:
+    assert diag.netmask_prefix_len(netmask) == expected
 
 
-@pytest.mark.parametrize("netmask", ["nonsense", "", "255.255.255", "256.0.0.0"])
-def test_ipv4_prefix_len_rejects_unparseable_mask(netmask: str) -> None:
-    """A mask we can't read must not fabricate a prefix – the caller prints the
-    raw netmask instead, which is still true."""
-    assert diag.ipv4_prefix_len(netmask) is None
+@pytest.mark.parametrize("netmask", ["nonsense", "", "255.255.255", "256.0.0.0", "255.0.255.0"])
+def test_netmask_prefix_len_rejects_an_unusable_mask(netmask: str) -> None:
+    """A mask we cannot read must not fabricate a prefix, and a
+    non-contiguous one is not a prefix at all - the caller prints the raw
+    netmask instead, which is still true."""
+    assert diag.netmask_prefix_len(netmask) is None
 
 
 def test_read_default_routes_returns_gateway_and_interface(tmp_path: Path) -> None:
-    """Little-endian hex, as the kernel writes it: 0101A8C0 is 192.168.1.1."""
+    """Little-endian hex, as the kernel writes it: 010200C0 is 192.168.1.1."""
     path = _route_file(
         tmp_path,
-        "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
-        "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",
+        "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "eth0\t006433C6\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",
     )
-    assert diag.read_default_routes(path) == [("eth0", "192.168.1.1")]
+    assert diag.read_default_routes(path) == [("eth0", "192.0.2.1", 100)]
 
 
 def test_read_default_routes_distinguishes_absent_table_from_no_route(tmp_path: Path) -> None:
@@ -3164,8 +3173,8 @@ def test_read_default_routes_skips_rows_that_are_not_usable_defaults(tmp_path: P
     path = _route_file(
         tmp_path,
         "short\tline\n"  # fewer than 4 fields
-        "eth0\t0001A8C0\t0101A8C0\t0003\t0\t0\t0\t0\t0\t0\t0\n"  # not the default route
-        "eth0\t00000000\t0101A8C0\t0001\t0\t0\t0\t0\t0\t0\t0\n"  # RTF_GATEWAY clear
+        "eth0\t006433C6\t010200C0\t0003\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"  # not the default route
+        "eth0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n"  # on-link, no gateway
         "eth0\t00000000\tZZZZ\t0003\t0\t0\t0\t0\t0\t0\t0\n"  # unparseable gateway
         "eth0\t00000000\tFFFFFFFFFF\t0003\t0\t0\t0\t0\t0\t0\t0\n",  # wider than four octets
     )
@@ -3175,9 +3184,9 @@ def test_read_default_routes_skips_rows_that_are_not_usable_defaults(tmp_path: P
 def test_collect_network_interfaces_reports_prefix_and_default_route(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The bundle that prompted this reported ``eth0 192.168.3.5`` and nothing
-    else, so a camera on 192.168.1.100 read as a normal address on a healthy
-    interface. Prefix plus default route is what makes it off-subnet."""
+    """A bundle reporting ``eth0 <address>`` and nothing else makes a camera on
+    another subnet read as a normal address on a healthy interface. The prefix
+    plus the default route is what shows it is off-subnet."""
     import psutil
 
     monkeypatch.setattr(
@@ -3190,14 +3199,14 @@ def test_collect_network_interfaces_reports_prefix_and_default_route(
         "net_if_addrs",
         lambda: {
             "eth0": [
-                SimpleNamespace(family=socket.AF_INET, address="192.168.3.5", netmask="255.255.255.0"),
+                SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0"),
                 SimpleNamespace(family=socket.AF_INET6, address="fe80::1", netmask=None),
             ]
         },
     )
     rows = diag.collect_network_interfaces(_route_file(tmp_path, ""))
     joined = "\n".join(rows)
-    assert "ipv4 192.168.3.5/24" in joined
+    assert "ipv4 192.0.2.5/24" in joined
     assert "fe80::1" not in joined
     assert "Default route:  none" in joined
 
@@ -3224,8 +3233,8 @@ def test_collect_network_interfaces_renders_each_default_route(monkeypatch: pyte
         psutil, "net_if_stats", lambda: {"eth0": SimpleNamespace(isup=True, speed=0, mtu=1500, duplex=1)}
     )
     monkeypatch.setattr(psutil, "net_if_addrs", lambda: {})
-    path = _route_file(tmp_path, "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
-    assert "  Default route:  via 192.168.1.1 on eth0" in diag.collect_network_interfaces(path)
+    path = _route_file(tmp_path, "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
+    assert "  Default route:  via 192.0.2.1 on eth0 (metric 100)" in diag.collect_network_interfaces(path)
 
 
 def test_collect_network_interfaces_survives_unreadable_addresses(
@@ -3580,7 +3589,7 @@ def test_normalise_log_line_keeps_numbers_that_distinguish_messages() -> None:
 
 def test_collapse_repeated_blocks_folds_a_reconnect_cycle() -> None:
     """A failing source repeats a *cycle*, not a line: the bundle that prompted
-    this was 381 kB of the same three-line loop. Collapsing only adjacent
+    such a bundle is almost entirely the same three-line loop. Collapsing only adjacent
     identical lines would have left it untouched."""
     lines: list[str] = []
     for minute in range(20, 26):
@@ -3720,3 +3729,490 @@ def test_annotate_log_discontinuities_ignores_lines_without_a_stamp() -> None:
 )
 def test_log_line_stamp_rejects_unparseable_prefixes(line: str) -> None:
     assert diag._log_line_stamp(line) is None
+
+
+# ---------------------------------------------------------------------------
+# A5 – video source reachability
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_host_bounded_passes_an_ip_literal_straight_through() -> None:
+    """No lookup for something already an address - the fast path is also the
+    only one guaranteed to work on a LAN with no resolver."""
+    assert diag.resolve_host_bounded("198.51.100.10") == ("198.51.100.10", "")
+
+
+def test_resolve_host_bounded_reports_a_failed_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail(*_a: Any, **_k: Any) -> Any:
+        raise OSError("no such host")
+
+    monkeypatch.setattr(diag.socket, "getaddrinfo", _fail)
+    address, note = diag.resolve_host_bounded("cam.invalid")
+    assert address is None
+    assert "does not resolve" in note
+
+
+def test_resolve_host_bounded_gives_up_on_a_hanging_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``getaddrinfo`` takes no timeout argument, so a show LAN with no
+    resolver would hang the whole bundle download on this one call."""
+    release = threading.Event()
+
+    def _hang(*_a: Any, **_k: Any) -> Any:
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(diag.socket, "getaddrinfo", _hang)
+    try:
+        address, note = diag.resolve_host_bounded("cam.local", timeout_s=0.05)
+        assert address is None
+        assert "timed out" in note
+    finally:
+        release.set()
+
+
+def test_resolve_host_bounded_returns_the_resolved_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        diag.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [(socket.AF_INET, None, None, "", ("10.1.2.3", 0))],
+    )
+    assert diag.resolve_host_bounded("cam.local") == ("10.1.2.3", "resolves to 10.1.2.3")
+
+
+def _addrs(monkeypatch: pytest.MonkeyPatch, mapping: dict[str, list[Any]]) -> None:
+    import psutil
+
+    monkeypatch.setattr(psutil, "net_if_addrs", lambda: mapping)
+
+
+def test_describe_address_reachability_reports_on_link(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="198.51.100.5", netmask="255.255.255.0")]},
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", _route_file(tmp_path, ""))
+    assert "on-link via eth0 198.51.100.5/24" in rows[0]
+
+
+def test_describe_address_reachability_names_the_ticket_case(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A station addressed on one subnet, the camera on another, nothing to
+    carry the packet. One line says so."""
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0")]},
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", _route_file(tmp_path, ""))
+    assert "NOT on any local subnet, and no route covers it" in rows[0]
+
+
+def test_describe_address_reachability_names_the_gateway_when_there_is_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0")]},
+    )
+    path = _route_file(tmp_path, "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "routed via 192.0.2.1 on eth0 (route 0.0.0.0/0, metric 100)" in rows[0]
+
+
+def test_describe_address_reachability_handles_an_unreadable_route_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _addrs(monkeypatch, {})
+    rows = diag.describe_address_reachability("198.51.100.10", tmp_path / "absent")
+    assert "routing unknown (kernel route table unreadable)" in rows[0]
+
+
+def test_describe_address_reachability_skips_entries_it_cannot_parse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _addrs(
+        monkeypatch,
+        {
+            "lo": [SimpleNamespace(family=socket.AF_INET6, address="::1", netmask=None)],
+            "eth0": [
+                SimpleNamespace(family=socket.AF_INET, address="10.0.0.2", netmask=None),
+                SimpleNamespace(family=socket.AF_INET, address="10.0.0.2", netmask="bogus"),
+            ],
+        },
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", _route_file(tmp_path, ""))
+    assert "no route covers it" in rows[0]
+
+
+def test_describe_address_reachability_rejects_a_non_address(tmp_path: Path) -> None:
+    rows = diag.describe_address_reachability("not-an-ip", _route_file(tmp_path, ""))
+    assert "is not an IPv4/IPv6 address" in rows[0]
+
+
+def test_describe_address_reachability_survives_unreadable_interfaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psutil
+
+    def _boom() -> dict[str, Any]:
+        raise OSError("nope")
+
+    monkeypatch.setattr(psutil, "net_if_addrs", _boom)
+    rows = diag.describe_address_reachability("10.0.0.1", _route_file(tmp_path, ""))
+    assert "interface addresses could not be read" in rows[0]
+
+
+def test_probe_tcp_connect_reports_a_refusal() -> None:
+    """A closed port on a reachable host is a different answer from silence,
+    and the difference is the whole point of the probe."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    outcome = diag.probe_tcp_connect("127.0.0.1", port, timeout_s=1.0)
+    assert "connected" not in outcome
+    assert "Error" in outcome or "refused" in outcome.lower()
+
+
+def test_probe_tcp_connect_reports_a_listening_port() -> None:
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        assert "connected" in diag.probe_tcp_connect("127.0.0.1", port, timeout_s=1.0)
+
+
+def test_probe_tcp_connect_reports_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _timeout(*_a: Any, **_k: Any) -> Any:
+        raise TimeoutError
+
+    monkeypatch.setattr(diag.socket, "create_connection", _timeout)
+    assert "no response within" in diag.probe_tcp_connect("10.255.255.1", 554, timeout_s=1.5)
+
+
+def test_collect_source_reachability_reports_not_wired() -> None:
+    assert "not wired" in diag.collect_source_reachability(diag.DiagnosticsProviders())[0]
+
+
+def test_collect_source_reachability_skips_an_input_that_dials_nothing() -> None:
+    """A USB camera, a listener and discovery-by-name have no address whose
+    reachability could be the problem."""
+    rows = diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: None))
+    assert "dials no remote host" in rows[0]
+
+
+def test_collect_source_reachability_survives_a_raising_provider() -> None:
+    def _boom() -> dict[str, Any]:
+        raise RuntimeError("registry exploded")
+
+    rows = diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=_boom))
+    assert "registry exploded" in "\n".join(rows)
+
+
+def test_collect_source_reachability_answers_the_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """End to end on that configuration: the one section that answers it on
+    first read."""
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0")]},
+    )
+    monkeypatch.setattr(diag, "_PROC_NET_ROUTE", _route_file(tmp_path, ""))
+    monkeypatch.setattr(diag, "probe_tcp_connect", lambda *_a, **_k: "no response within 1.5 s")
+    endpoint = {"host": "198.51.100.10", "port": 554, "connection_oriented": True, "source_type": "rtsp"}
+    joined = "\n".join(diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint)))
+    assert "rtsp -> 198.51.100.10:554" in joined
+    assert "NOT on any local subnet" in joined
+    assert "no response within 1.5 s" in joined
+
+
+def test_collect_source_reachability_does_not_probe_a_udp_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SRT dials out, but over UDP - connect() puts no packet on the wire, so
+    a "connected" result there would be a lie."""
+    _addrs(monkeypatch, {})
+    monkeypatch.setattr(diag, "_PROC_NET_ROUTE", _route_file(tmp_path, ""))
+
+    def _must_not_run(*_a: Any, **_k: Any) -> str:
+        raise AssertionError("a UDP endpoint must not be probed")
+
+    monkeypatch.setattr(diag, "probe_tcp_connect", _must_not_run)
+    endpoint = {"host": "10.0.0.5", "port": 1600, "connection_oriented": False, "source_type": "srt"}
+    joined = "\n".join(diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint)))
+    assert "rides UDP, where a connect proves nothing" in joined
+
+
+def test_collect_source_reachability_warns_before_leaving_the_lan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The probe is allowed to reach a public host, and the bundle has to say
+    when it did - that is the condition on the offline contract's fourth
+    documented exception."""
+    _addrs(monkeypatch, {})
+    monkeypatch.setattr(diag, "_PROC_NET_ROUTE", _route_file(tmp_path, ""))
+    monkeypatch.setattr(diag, "probe_tcp_connect", lambda *_a, **_k: "connected in under 1.5 s")
+    # Not a documentation range: Python classifies 203.0.113.0/24 (TEST-NET-3)
+    # as private, so it would never trip the warning.
+    endpoint = {"host": "8.8.8.8", "port": 554, "connection_oriented": True, "source_type": "rtsp"}
+    joined = "\n".join(diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint)))
+    assert "public internet address" in joined
+    assert "No stream data is sent or received" in joined
+
+
+def test_collect_source_reachability_stays_quiet_for_a_lan_address(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _addrs(monkeypatch, {})
+    monkeypatch.setattr(diag, "_PROC_NET_ROUTE", _route_file(tmp_path, ""))
+    monkeypatch.setattr(diag, "probe_tcp_connect", lambda *_a, **_k: "connected in under 1.5 s")
+    endpoint = {"host": "198.51.100.10", "port": 554, "connection_oriented": True, "source_type": "rtsp"}
+    joined = "\n".join(diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint)))
+    assert "public internet" not in joined
+
+
+def test_collect_source_reachability_stops_at_an_unresolvable_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing downstream is meaningful without an address, and probing a name
+    we could not resolve would just spend the budget twice."""
+    monkeypatch.setattr(diag, "resolve_host_bounded", lambda *_a, **_k: (None, "DNS lookup failed"))
+
+    def _must_not_run(*_a: Any, **_k: Any) -> str:
+        raise AssertionError("must not probe without an address")
+
+    monkeypatch.setattr(diag, "probe_tcp_connect", _must_not_run)
+    endpoint = {"host": "cam.invalid", "port": 554, "connection_oriented": True, "source_type": "rtsp"}
+    rows = diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint))
+    assert "DNS lookup failed" in rows[-1]
+
+
+# ---------------------------------------------------------------------------
+# A5 – bounded resolvers, address families, and real route matching
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_host_bounded_skips_when_earlier_lookups_are_still_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Giving up on a lookup does not stop it. On the resolver-less LAN this
+    bounding exists for, repeated bundle downloads would otherwise pile up a
+    thread apiece."""
+    release = threading.Event()
+
+    def _hang(*_a: Any, **_k: Any) -> Any:
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(diag.socket, "getaddrinfo", _hang)
+    try:
+        for _ in range(diag._MAX_INFLIGHT_DNS):
+            address, note = diag.resolve_host_bounded("cam.local", timeout_s=0.05)
+            assert address is None
+            assert "timed out" in note
+        address, note = diag.resolve_host_bounded("cam.local", timeout_s=0.05)
+        assert address is None
+        assert "skipped" in note
+    finally:
+        release.set()
+    # The worker owns its slot and hands it back when it finally returns, so
+    # the cap is a cap and not a one-way latch.
+    reclaimed = []
+    deadline = time.monotonic() + 5.0
+    while len(reclaimed) < diag._MAX_INFLIGHT_DNS and time.monotonic() < deadline:
+        if diag._dns_slots.acquire(blocking=False):
+            reclaimed.append(True)
+    for _ in reclaimed:
+        diag._dns_slots.release()
+    assert len(reclaimed) == diag._MAX_INFLIGHT_DNS
+
+
+def test_describe_address_reachability_matches_an_ipv6_target_on_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An IPv6 literal passes the resolver's fast path, so the analysis has to
+    answer for it. Matching only AF_INET interfaces reported an on-link camera
+    as off-subnet - a confident false statement, worse than none."""
+    _addrs(
+        monkeypatch,
+        {
+            "eth0": [
+                SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0"),
+                SimpleNamespace(family=socket.AF_INET6, address="2001:db8::5%eth0", netmask="ffff:ffff:ffff:ffff::"),
+            ]
+        },
+    )
+    rows = diag.describe_address_reachability("2001:db8::1", _route_file(tmp_path, ""))
+    assert "on-link via eth0 2001:db8::5/64" in rows[0]
+
+
+def test_describe_address_reachability_declines_to_guess_at_ipv6_routing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The kernel's v6 table is elsewhere and in another format. Running the
+    v4 analysis over a v6 target would print a verdict about an unrelated
+    table."""
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0")]},
+    )
+    path = _route_file(tmp_path, "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
+    rows = diag.describe_address_reachability("2001:db8::1", path)
+    assert "IPv6 routing is not analysed" in rows[0]
+    assert "192.0.2.1" not in rows[0]
+
+
+def test_describe_address_reachability_follows_a_destination_specific_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A station can hold a route to the camera's network and no default route
+    at all. Reading only default routes called that unreachable."""
+    _addrs(
+        monkeypatch,
+        {"eth0": [SimpleNamespace(family=socket.AF_INET, address="192.0.2.5", netmask="255.255.255.0")]},
+    )
+    path = _route_file(tmp_path, "eth0\t006433C6\t010200C0\t0003\t0\t0\t100\t00FFFFFF\t0\t0\t0\n")
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "routed via 192.0.2.1 on eth0 (route 198.51.100.0/24, metric 100)" in rows[0]
+
+
+def test_describe_address_reachability_prefers_the_longest_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same rule the kernel applies when it picks one."""
+    _addrs(monkeypatch, {})
+    path = _route_file(
+        tmp_path,
+        "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"  # default via .3.1
+        "eth1\t006433C6\t020200C0\t0003\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",  # /24 via .3.2
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "192.0.2.2 on eth1" in rows[0]
+
+
+def test_describe_address_reachability_names_a_directly_connected_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gateway of 0.0.0.0 is the kernel saying "no hop needed"."""
+    _addrs(monkeypatch, {})
+    path = _route_file(tmp_path, "eth0\t006433C6\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n")
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "198.51.100.0/24 is directly connected on eth0" in rows[0]
+
+
+def test_read_routes_reports_an_unreadable_table_as_unknown(tmp_path: Path) -> None:
+    assert diag.read_routes(tmp_path / "absent") is None
+
+
+def test_read_routes_skips_rows_it_cannot_parse(tmp_path: Path) -> None:
+    path = _route_file(
+        tmp_path,
+        "too\tshort\n"
+        "eth0\tZZZZ\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+        "eth0\t006433C6\t00000000\t0001\t0\t0\t0\tNOTAMASK\t0\t0\t0\n",
+    )
+    assert diag.read_routes(path) == []
+
+
+def test_describe_address_reachability_skips_an_entry_whose_mask_is_the_wrong_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Defensive: the prefix comes from the same entry's netmask, so a v4
+    address carrying a v6 mask is platform data we cannot make sense of. It is
+    skipped rather than allowed to abort the section."""
+    _addrs(
+        monkeypatch,
+        {
+            "eth0": [
+                SimpleNamespace(family=socket.AF_INET, address="198.51.100.5", netmask="ffff:ffff:ffff:ffff::"),
+            ]
+        },
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", _route_file(tmp_path, ""))
+    assert "no route covers it" in rows[0]
+
+
+def test_collect_source_reachability_reports_an_unusable_source_without_probing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source that cannot be dialled as written gets said so and nothing
+    else: every figure derived from a repaired URL would describe an endpoint
+    the pipeline never opens."""
+
+    def _must_not_run(*_a: Any, **_k: Any) -> str:
+        raise AssertionError("an unusable endpoint must not be probed")
+
+    monkeypatch.setattr(diag, "probe_tcp_connect", _must_not_run)
+    monkeypatch.setattr(diag, "resolve_host_bounded", _must_not_run)
+    endpoint = {
+        "host": "cam.local",
+        "port": 0,
+        "connection_oriented": True,
+        "source_type": "rtsp",
+        "problem": "the URL's port is not a usable number",
+    }
+    rows = diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint))
+    assert rows == [
+        "  Configured source:  rtsp -> cam.local",
+        f"  {'':<20}UNUSABLE: the URL's port is not a usable number",
+    ]
+
+
+def test_collect_source_reachability_names_an_unregistered_source_type() -> None:
+    endpoint = {
+        "host": "",
+        "port": 0,
+        "connection_oriented": False,
+        "source_type": "no-such-plugin",
+        "problem": "'no-such-plugin' is not a registered video input on this station",
+    }
+    rows = diag.collect_source_reachability(diag.DiagnosticsProviders(source_endpoint=lambda: endpoint))
+    assert "no-such-plugin -> (none)" in rows[0]
+    assert "not a registered video input" in rows[1]
+
+
+def test_describe_address_reachability_prefers_the_lowest_metric(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The kernel picks the longest prefix, then the lowest metric. A
+    multi-homed station really does carry several default routes - the test Pi
+    has three - and ignoring the metric names whichever the table happened to
+    list first. The fixture is deliberately worst-first so list order cannot
+    be what produces the right answer.
+    """
+    _addrs(monkeypatch, {})
+    path = _route_file(
+        tmp_path,
+        "eth0\t00000000\t01B2A8C0\t0003\t0\t0\t102\t00000000\t0\t0\t0\n"
+        "enxB\t00000000\t01B2A8C0\t0003\t0\t0\t101\t00000000\t0\t0\t0\n"
+        "enxA\t00000000\t01B2A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "on enxA" in rows[0]
+    assert "metric 100" in rows[0]
+
+
+def test_describe_address_reachability_still_prefers_prefix_over_metric(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Metric only breaks ties: a specific route wins over a default even when
+    the default has the better metric."""
+    _addrs(monkeypatch, {})
+    path = _route_file(
+        tmp_path,
+        "eth0\t00000000\t01B2A8C0\t0003\t0\t0\t1\t00000000\t0\t0\t0\n"
+        "enxB\t006433C6\t02B2A8C0\t0003\t0\t0\t900\t00FFFFFF\t0\t0\t0\n",
+    )
+    rows = diag.describe_address_reachability("198.51.100.10", path)
+    assert "on enxB" in rows[0]
+    assert "198.51.100.0/24" in rows[0]
+
+
+def test_read_default_routes_orders_by_metric(tmp_path: Path) -> None:
+    path = _route_file(
+        tmp_path,
+        "eth0\t00000000\t01B2A8C0\t0003\t0\t0\t102\t00000000\t0\t0\t0\n"
+        "enxA\t00000000\t01B2A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+    )
+    assert [iface for iface, _gw, _metric in diag.read_default_routes(path) or []] == ["enxA", "eth0"]
+
+
+def test_read_routes_skips_a_row_with_an_unreadable_metric(tmp_path: Path) -> None:
+    path = _route_file(tmp_path, "eth0\t00000000\t01B2A8C0\t0003\t0\t0\tNOTANUM\t00000000\t0\t0\t0\n")
+    assert diag.read_routes(path) == []

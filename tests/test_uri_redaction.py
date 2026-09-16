@@ -76,8 +76,17 @@ class TestRedactUri:
         assert redact_uri("rtsp://user:pass@cam/s") == "rtsp://cam/s"
         assert redact_uri("srt://h:5000?passphrase=x") == "srt://h:5000?passphrase=***"
 
-    def test_keeps_a_fragment(self) -> None:
-        assert redact_uri("rtsp://u:p@h/s?passphrase=x#frag") == "rtsp://h/s?passphrase=***#frag"
+    def test_drops_a_fragment_that_trails_a_masked_secret(self) -> None:
+        """Deliberately reversed. This asserted the fragment survived, which
+        assumes a parse can tell ``?passphrase=x#frag`` (value plus fragment)
+        from a passphrase that simply contains a ``#`` - it cannot, and the
+        module's rule for exactly that ambiguity elsewhere is to fail closed.
+        Neither RTSP nor SRT gives a fragment any meaning, so the cost of
+        dropping it is nil against publishing half a passphrase."""
+        assert redact_uri("rtsp://u:p@h/s?passphrase=x#frag") == "rtsp://h/s?passphrase=***#***"
+
+    def test_keeps_a_fragment_when_no_secret_was_masked(self) -> None:
+        assert redact_uri("rtsp://u:p@h/s#frag") == "rtsp://h/s#frag"
 
 
 class TestStripUriUserinfo:
@@ -228,3 +237,200 @@ class TestRedactUrisInText:
     def test_credential_free_text_is_untouched(self) -> None:
         line = "INFO video: RTSP source: rtsp://192.168.0.182:554/stream1 (latency=0)"
         assert redact_uris_in_text(line) == line
+
+
+# ---------------------------------------------------------------------------
+# An ``@`` that is not userinfo
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (
+            "srt://10.0.0.5:1600?passphrase=Sh@w2026",
+            "srt://10.0.0.5:1600?passphrase=***",
+        ),
+        (
+            "srt://10.0.0.5:1600?streamid=live@stage&latency=125",
+            "srt://10.0.0.5:1600?streamid=***&latency=125",
+        ),
+    ],
+)
+def test_redact_uri_keeps_the_host_when_the_at_is_inside_a_query_value(uri: str, expected: str) -> None:
+    """A passphrase holding an ``@`` is ordinary - operators pick show names
+    like ``Sh@w2026``. Treating that ``@`` as possible userinfo collapsed the
+    whole URI to ``srt://***``, so the HUD label, ``/api/stats``, the
+    Statistics panel and the bundle all lost the address, while the query
+    masking that already handles it correctly never ran."""
+    assert redact_uri(uri) == expected
+
+
+def test_redact_uri_still_fails_closed_on_an_at_in_the_path() -> None:
+    """Narrowing the check to authority-and-path must not narrow it further:
+    a ``/`` in a password puts the rest in the path, and nothing distinguishes
+    that from a genuine path ``@``, so the unprovable case stays closed."""
+    assert redact_uri("rtsp://operator:pa/ss@cam.local:554/stream") == "rtsp://***"
+
+
+def test_redact_uris_in_text_strips_a_password_containing_a_slash() -> None:
+    """The scheme rule stops at the first ``/`` and the schemeless rule
+    excludes one, so this shape reached the bundle verbatim - and it arrives
+    through GStreamer's own ``location`` debug string, on exactly the auth
+    failure that makes an operator send us a bundle."""
+    text = "gstrtspsrc.c(9070): location=rtsp://operator:pa/ss@cam.local:554/stream failed"
+    redacted = redact_uris_in_text(text)
+    assert "pa/ss" not in redacted
+    assert "operator" not in redacted
+    assert "rtsp://cam.local:554/stream" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "location=rtsp://cam.local:554/path@with@at",
+        "location=rtsp://cam.local/p@th",
+        "location=http://host:8080/a@b/c",
+    ],
+)
+def test_redact_uris_in_text_leaves_a_path_at_alone(text: str) -> None:
+    """A numeric port says the authority is a real host, so the ``@`` is in a
+    path. Deleting the run would strip the address out of a log line that has
+    no credential in it at all."""
+    assert redact_uris_in_text(text) == text
+
+
+def test_redact_uris_in_text_handles_two_uris_on_one_line() -> None:
+    text = "from rtsp://u:pa/ss@cam1/s to rtsp://cam2:554/x"
+    redacted = redact_uris_in_text(text)
+    assert "pa/ss" not in redacted
+    assert "rtsp://cam1/s" in redacted
+    assert "rtsp://cam2:554/x" in redacted
+
+
+# ---------------------------------------------------------------------------
+# A "fragment" is often the tail of the secret
+# ---------------------------------------------------------------------------
+
+
+def test_redact_uri_fails_closed_on_a_hash_inside_a_password() -> None:
+    """``rtsp://user:pa#ss@cam/s`` parses with netloc ``user:pa`` and the rest
+    of the credential in what looks like a fragment - the mirror of a ``/`` in
+    a password putting it in the path. Narrowing the fail-closed check to the
+    authority alone published this one in full."""
+    assert redact_uri("rtsp://user:pa#ss@cam.local/s") == "rtsp://***"
+
+
+def test_redact_uri_fails_closed_on_an_at_in_a_fragment() -> None:
+    assert redact_uri("srt://10.0.0.5:1600?passphrase=show#act@2026") == "srt://***"
+
+
+def test_redact_uri_drops_a_fragment_that_follows_a_masked_secret() -> None:
+    """``?passphrase=show#act2026`` is a passphrase containing a ``#`` as
+    readily as a value plus a fragment, and no parse can tell them apart.
+    Printing the tail publishes half the secret; the separator survives so the
+    reader can see something was removed."""
+    assert redact_uri("srt://10.0.0.5:1600?passphrase=show#act2026") == "srt://10.0.0.5:1600?passphrase=***#***"
+
+
+def test_redact_uri_keeps_a_fragment_when_nothing_was_masked() -> None:
+    """Nothing was secret, so nothing is ambiguous."""
+    assert redact_uri("rtsp://cam.local:554/s#chapter1") == "rtsp://cam.local:554/s#chapter1"
+
+
+# ---------------------------------------------------------------------------
+# Bracketed IPv6 authorities
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "location=rtsp://[2001:db8::1]:554/path@2x",
+        "location=rtsp://[2001:db8::1]/p@th",
+        "location=rtsp://[2001:db8::1]:554/stream",
+    ],
+)
+def test_redact_uris_in_text_leaves_a_bracketed_ipv6_host_alone(text: str) -> None:
+    """Every IPv6 literal is full of colons, so the port test that separates
+    userinfo from ``host:port`` reads one as a password and eats a URI that
+    never carried a credential."""
+    assert redact_uris_in_text(text) == text
+
+
+def test_redact_uris_in_text_still_strips_userinfo_before_an_ipv6_host() -> None:
+    text = "location=rtsp://u:p/w@[2001:db8::1]:554/s"
+    redacted = redact_uris_in_text(text)
+    assert "u:p/w" not in redacted
+    assert "rtsp://[2001:db8::1]:554/s" in redacted
+
+
+def test_redact_uris_in_text_leaves_an_unclosed_bracket_alone() -> None:
+    """A malformed authority is not a licence to delete the line.
+
+    The address has to carry colons: ``[bad`` passes this even with the
+    bracket guard removed entirely, because the colon test it is guarding
+    never fires. An unterminated literal is precisely where that test did its
+    damage.
+    """
+    text = "location=rtsp://[2001:db8::1/p@th"
+    assert redact_uris_in_text(text) == text
+
+
+# ---------------------------------------------------------------------------
+# A password can scatter itself into the query too
+# ---------------------------------------------------------------------------
+
+
+def test_redact_uri_fails_closed_on_a_question_mark_inside_a_password() -> None:
+    """``rtsp://user:pa?ss@cam/stream`` parses with the rest of the credential
+    in the query string, where it matches no key we mask and would be rejoined
+    verbatim. Third spelling of one ambiguity, after ``/`` into the path and
+    ``#`` into the fragment."""
+    assert redact_uri("rtsp://user:pa?ss@cam.local/stream") == "rtsp://***"
+
+
+def test_redact_uri_still_keeps_the_host_for_an_at_inside_a_masked_value() -> None:
+    """The narrowing this guards must not swallow the case it exists for."""
+    assert redact_uri("srt://10.0.0.5:1600?passphrase=Sh@w2026") == "srt://10.0.0.5:1600?passphrase=***"
+
+
+def test_redact_uri_masks_only_the_secret_among_several_parameters() -> None:
+    assert redact_uri("srt://h:1600?latency=125&passphrase=a@b") == "srt://h:1600?latency=125&passphrase=***"
+
+
+# ---------------------------------------------------------------------------
+# Rule order and run boundaries in free text
+# ---------------------------------------------------------------------------
+
+
+def test_redact_uris_in_text_strips_a_password_holding_both_an_at_and_a_slash() -> None:
+    """The first-slash rule truncates such a password at the ``/`` and leaves
+    nothing with a colon behind it, so whichever rule sees the run first has
+    to be the one that can read the whole of it."""
+    redacted = redact_uris_in_text("location=rtsp://operator:p@a/ss@cam/s")
+    assert "p@a/ss" not in redacted
+    assert "operator" not in redacted
+    assert "rtsp://cam/s" in redacted
+
+
+def test_redact_uris_in_text_judges_each_uri_on_its_own_authority() -> None:
+    """Only whitespace used to end a run, so two URIs separated by anything
+    else were spanned as one and the first authority decided for both."""
+    redacted = redact_uris_in_text("rtsp://cam.local:554/a@b,rtsp://user:pa/ss@cam2/s")
+    assert "user:pa/ss" not in redacted
+    assert "rtsp://cam.local:554/a@b" in redacted  # clean, left intact
+    assert "rtsp://cam2/s" in redacted
+
+
+def test_redact_uris_in_text_does_not_delete_a_clean_uri_behind_a_dirty_one() -> None:
+    redacted = redact_uris_in_text("rtsp://u:pa/ss@cam1/s,rtsp://cam2:554/p@th")
+    assert "u:pa/ss" not in redacted
+    assert "rtsp://cam1/s" in redacted
+    assert "rtsp://cam2:554/p@th" in redacted
+
+
+def test_redact_uris_in_text_still_strips_userinfo_without_a_colon() -> None:
+    """The cross-slash rule declines this one (no colon to judge), so it has
+    to still reach the simpler rule that runs after it."""
+    assert redact_uris_in_text("location=rtsp://user@host/s") == "location=rtsp://host/s"

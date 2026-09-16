@@ -53,6 +53,44 @@ _SCHEMELESS_USERINFO_IN_TEXT_RE = re.compile(
     r"(?<![\w@.+-])[^\s:@/?#]+:[^\s@/?#]*@(?=[^\s@/?#]*\.[^\s@/?#]|[^\s@/?#]+/)",
 )
 
+# ``scheme://user:pa/ss@host`` in free text - a password holding an unencoded
+# ``/``. The scheme rule above stops at the first ``/`` and the schemeless rule
+# excludes one, so this shape slipped past both and published the credential
+# verbatim, while ``redact_uri`` on the same string fails closed.
+#
+# Catching it needs a run that crosses slashes, which also spans an ordinary
+# ``@`` in a path, so the authority decides which it is: a numeric port
+# (``cam.local:554/p@th``) is a real host and is left alone, anything else in
+# that position (``operator:pa/ss@cam.local``) is userinfo and goes.
+# The run is tempered so it cannot cross a second ``://``: without that, two
+# URIs separated by anything but whitespace are spanned as one and the first
+# authority decides for both - leaving the second URI's credential intact, or
+# deleting a clean second URI because the first looked like userinfo.
+_SCHEME_RUN_TO_AT_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)((?:(?!://)[^\s?#])*)@")
+
+
+def _strip_scheme_userinfo_across_slash(text: str) -> str:
+    """Drop ``scheme://user:pa/ss@`` runs the authority shows to be userinfo."""
+
+    def _replace(match: re.Match[str]) -> str:
+        scheme, run = match.group(1), match.group(2)
+        authority = run.partition("/")[0]
+        if authority.startswith("["):
+            # An IPv6 literal is all colons, so the port test below reads one
+            # as a password and eats a URI that carried no credential. RFC 3986
+            # keeps ``[`` out of userinfo entirely and reserves it for an
+            # IP-literal, so a leading bracket settles it without having to
+            # parse the address - which matters, because an *unterminated*
+            # bracket is exactly where the colon test did its damage.
+            return match.group(0)
+        _host, sep, port = authority.partition(":")
+        if sep and not port.isdigit():
+            return scheme
+        return match.group(0)
+
+    return _SCHEME_RUN_TO_AT_RE.sub(_replace, text)
+
+
 # A secret query value in free text, running to the next separator.
 _SECRET_QUERY_IN_TEXT_RE = re.compile(
     r"(?i)([?&](?:" + "|".join(sorted(_REDACTED_QUERY_KEYS)) + r")=)[^&\s\"'<>]*",
@@ -129,21 +167,36 @@ def redact_uri(uri: str) -> str:
     it describes.
     """
     stripped = strip_uri_userinfo(uri)
-    scheme, sep, rest = stripped.partition("://")
-    if sep and "@" in rest:
-        # Userinfo survived the parse. A ``/`` in a password puts it in the
-        # path (``rtsp://user:pa/ss@cam/s`` splits as netloc ``user:pa``), and
-        # nothing distinguishes that from a genuine ``@`` in a path. Since this
-        # feeds the HUD label, our own logging and the bundle's config dump,
-        # the unprovable case fails closed rather than printing the secret.
-        return f"{scheme}://{REDACTION}"
+    scheme, sep, _rest = stripped.partition("://")
     head, query, hash_sep, fragment = _split_query(stripped)
+
+    # A credential is only provably safe inside the value of a key we are
+    # about to mask. Everywhere else an ``@`` is unprovable and fails closed:
+    # a password holding a ``/``, ``#`` or ``?`` scatters the rest of itself
+    # into the path, the fragment or the query respectively, and no parse can
+    # tell the difference from a URI that never had a credential.
+    unsafe_at = "@" in head.partition("://")[2] or "@" in fragment
+    masked: list[str] = []
+    masked_a_secret = False
+    for part in query.split("&") if query else []:
+        key, eq, _value = part.partition("=")
+        if eq and key.lower() in _REDACTED_QUERY_KEYS:
+            masked.append(f"{key}={REDACTION}")
+            masked_a_secret = True
+            continue
+        unsafe_at = unsafe_at or "@" in part
+        masked.append(part)
+
+    if sep and unsafe_at:
+        return f"{scheme}://{REDACTION}"
     if not query:
         return stripped
-    masked = []
-    for part in query.split("&"):
-        key, eq, _value = part.partition("=")
-        masked.append(f"{key}={REDACTION}" if eq and key.lower() in _REDACTED_QUERY_KEYS else part)
+    if masked_a_secret and fragment:
+        # The same ambiguity one step on: ``?passphrase=show#act2026`` is a
+        # passphrase containing a ``#`` as readily as a value plus a fragment,
+        # and printing the tail publishes half the secret. The separator stays
+        # so the reader can see something was dropped.
+        return f"{head}?{'&'.join(masked)}{hash_sep}{REDACTION}"
     return f"{head}?{'&'.join(masked)}{hash_sep}{fragment}"
 
 
@@ -156,8 +209,15 @@ def redact_uris_in_text(text: str) -> str:
     in its debug string, and an auth failure is both the condition that puts it
     there and the condition that makes an operator send us a bundle.
     """
+    # Cross-slash first. The rule below stops at the first ``/``, so on a
+    # password holding both ``@`` and ``/`` it truncates there and leaves
+    # nothing with a colon for the cross-slash rule to recognise - publishing
+    # most of the password. Run the greedier rule while the whole run is still
+    # intact; whatever it declines (userinfo with no colon at all) still falls
+    # to the simpler one after.
+    text = _strip_scheme_userinfo_across_slash(text)
     text = _USERINFO_IN_TEXT_RE.sub(r"\1", text)
-    # After the scheme rule, a ``scheme://`` URI has no userinfo left, so this
+    # After the scheme rules, a ``scheme://`` URI has no userinfo left, so this
     # only ever sees the schemeless form.
     text = _SCHEMELESS_USERINFO_IN_TEXT_RE.sub("", text)
     return _SECRET_QUERY_IN_TEXT_RE.sub(r"\g<1>" + REDACTION, text)

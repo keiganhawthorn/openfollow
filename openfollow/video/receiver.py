@@ -10,10 +10,11 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
-from openfollow.runtime.receiver_bus import ReceiverBusHandler
+from openfollow.runtime.receiver_bus import BusError, ReceiverBusHandler
 from openfollow.runtime.receiver_pipeline import ReceiverPipelineAssembler
 from openfollow.runtime.receiver_state import ReceiverStateMachine
 from openfollow.video.connection_status import NdiStatusMarker
+from openfollow.video.failure import ConnectionPhase, SourceKind, VideoFailure, classify_failure
 from openfollow.video.inputs import get_input_class
 from openfollow.video.inputs._base import InputCapabilities, ReconnectPolicy
 
@@ -132,7 +133,9 @@ class GstNativeSinkReceiver:
         self._status_marker = NdiStatusMarker()
         source_label = self._input.get_source_label(self._input_config)
         if not source_label:
-            self._status_marker.set_disconnected(f"No {self._input.display_name} source configured")
+            self._status_marker.set_disconnected(
+                f"No {self._input.display_name} source configured", failure=VideoFailure.NOT_CONFIGURED
+            )
         else:
             self._status_marker.set_disconnected()
 
@@ -255,6 +258,11 @@ class GstNativeSinkReceiver:
     def source_name(self) -> str:
         """Return the active source label."""
         return self._input.get_source_label(self._input_config)
+
+    @property
+    def source_kind(self) -> SourceKind:
+        """What this input gets its video from, for wording its failures."""
+        return self._input.source_kind
 
     def _has_configured_source(self) -> bool:
         """Return True when the active input has a non-empty primary source value."""
@@ -436,6 +444,7 @@ class GstNativeSinkReceiver:
             self._discovery_thread = None
         self._null_transition_current_pipeline(swap_label="swap_input")
         self._reset_video_flow_state()
+        self._state.forget_video_history()
         self._state.reset_reconnect_backoff()
         self._state.deactivate_source_selection()
         self._input.cleanup()
@@ -468,7 +477,9 @@ class GstNativeSinkReceiver:
 
         source_label = self._input.get_source_label(self._input_config)
         if not source_label:
-            self._status_marker.set_disconnected(f"No {self._input.display_name} source configured")
+            self._status_marker.set_disconnected(
+                f"No {self._input.display_name} source configured", failure=VideoFailure.NOT_CONFIGURED
+            )
         else:
             self._status_marker.set_disconnected()
 
@@ -526,7 +537,7 @@ class GstNativeSinkReceiver:
         available, reason = self._input.__class__.is_available()
         if not available:
             logger.warning("%s is not available: %s", self._input.display_name, reason)
-            self._status_marker.set_disconnected(reason)
+            self._status_marker.set_disconnected(reason, failure=VideoFailure.UNKNOWN)
             self._state.set_placeholder_pipeline(True)
             self._create_placeholder_pipeline()
             return
@@ -543,7 +554,7 @@ class GstNativeSinkReceiver:
                 self._input.display_name,
                 e,
             )
-            self._status_marker.set_disconnected(str(e))
+            self._status_marker.set_disconnected(str(e), failure=VideoFailure.UNKNOWN)
             self._state.set_placeholder_pipeline(True)
             self._create_placeholder_pipeline()
             return
@@ -569,6 +580,61 @@ class GstNativeSinkReceiver:
                     # from a healthy one.
                     pad.add_probe(Gst.PadProbeType.BUFFER, self._on_sink_buffer)
                     self._sink_probes_added = True
+        # Per pipeline, unlike the sink probes: the source element is rebuilt
+        # on every reconnect.
+        self._attach_source_probe()
+        try:
+            self._input.observe_progress(self._pipeline, self._state.note_phase)
+        except Exception:
+            logger.exception("Error observing %s connection progress", self._input.display_name)
+
+    def _attach_source_probe(self) -> None:
+        """Watch for the first bytes out of the plugin's source element.
+
+        An input declaring none goes unobserved; classification then falls back
+        to what the error itself says.
+        """
+        name = self._input.source_element_name
+        if name is None or self._pipeline is None:
+            return
+        element = self._pipeline.get_by_name(name)
+        if element is None:
+            logger.debug("No element named %r to observe %s source bytes", name, self._input.display_name)
+            return
+        pad = element.get_static_pad("src")
+        if pad is not None:
+            pad.add_probe(Gst.PadProbeType.BUFFER, self._on_source_buffer)
+            return
+        # rtspsrc exposes no src pad until the server describes the stream.
+        try:
+            element.connect("pad-added", self._on_source_pad_added)
+        except Exception:
+            logger.debug("Cannot observe source bytes from %r", name, exc_info=True)
+
+    def _on_source_pad_added(self, _element: Any, pad: Any) -> None:
+        """Probe a late-arriving source pad, if it is the video one.
+
+        ``rtspsrc`` exposes one pad per SDP media track, and the RTSP plugin
+        deliberately links only the video track. Probing every pad would let an
+        audio-first or audio-only stream advance the phase on audio bytes, so a
+        timeout would then be diagnosed as video that arrived and failed to
+        decode. Caps we cannot read yet carry no media field; probe those rather
+        than miss the only pad we get.
+        """
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        caps_str = caps.to_string() if caps is not None else ""
+        if "media=(string)" in caps_str and "media=(string)video" not in caps_str:
+            logger.debug("Not observing non-video source pad %s (%s)", pad.get_name(), caps_str)
+            return
+        pad.add_probe(Gst.PadProbeType.BUFFER, self._on_source_buffer)
+
+    def _on_source_buffer(self, _pad: Any, _info: Any) -> int:
+        """First buffer out of the source element; runs on a streaming thread.
+
+        Removes itself - one byte is the whole signal.
+        """
+        self._state.note_phase(ConnectionPhase.DATA_ARRIVING)
+        return cast(int, Gst.PadProbeReturn.REMOVE)
 
     def get_sink_widget(self) -> Any:
         """Return the GTK widget from shared gtksink."""
@@ -591,7 +657,9 @@ class GstNativeSinkReceiver:
             # but show placeholder when no URL is configured.
             self._state.deactivate_source_selection()
             if not source_configured:
-                self._status_marker.set_disconnected(f"No {self._input.display_name} URL configured")
+                self._status_marker.set_disconnected(
+                    f"No {self._input.display_name} URL configured", failure=VideoFailure.NOT_CONFIGURED
+                )
                 self._state.set_placeholder_pipeline(True)
                 self._create_placeholder_pipeline()
                 widget = self.get_sink_widget()
@@ -609,11 +677,23 @@ class GstNativeSinkReceiver:
                     msg = bus.timed_pop_filtered(200 * Gst.MSECOND, Gst.MessageType.ERROR)
                     if msg:
                         err, dbg = msg.parse_error()
-                        error_msg = f"{err.message} – {dbg}"
+                        # The bus carries the same identity a posted ERROR would,
+                        # so it is classified the same way rather than flattened
+                        # into a string the taxonomy cannot read.
+                        bus_error = BusError(
+                            message=getattr(err, "message", "") or "Unknown error",
+                            domain=str(getattr(err, "domain", "") or ""),
+                            code=int(getattr(err, "code", 0) or 0),
+                            debug=str(dbg or ""),
+                        )
+                        error_msg = f"{bus_error.message} – {bus_error.debug}"
+                        logger.error("%s pipeline error: %s", self._input.display_name, error_msg)
+                        self._schedule_reconnect(error_msg, bus_error)
                     else:
+                        # Nothing on the bus: the failure is this station's own.
                         error_msg = f"{self._input.display_name} pipeline failed to start"
-                    logger.error("%s pipeline error: %s", self._input.display_name, error_msg)
-                    self._schedule_reconnect(error_msg)
+                        logger.error("%s pipeline error: %s", self._input.display_name, error_msg)
+                        self._schedule_reconnect(error_msg, failure=VideoFailure.UNKNOWN)
                 else:
                     if self._state.is_placeholder_pipeline:
                         logger.info(
@@ -636,7 +716,9 @@ class GstNativeSinkReceiver:
         if not source_label:
             # No source configured – show placeholder and start discovery
             self._state.activate_source_selection()
-            self._status_marker.set_disconnected(f"Select a {self._input.display_name} source")
+            self._status_marker.set_disconnected(
+                f"Select a {self._input.display_name} source", failure=VideoFailure.NOT_CONFIGURED
+            )
             self._create_placeholder_pipeline()
 
             widget = self.get_sink_widget()
@@ -663,7 +745,7 @@ class GstNativeSinkReceiver:
             result = self._pipeline.set_state(Gst.State.PLAYING)
             if result == Gst.StateChangeReturn.FAILURE:
                 logger.error("Pipeline set_state(PLAYING) returned FAILURE.")
-                self._schedule_reconnect("Pipeline failed to start")
+                self._schedule_reconnect("Pipeline failed to start", failure=VideoFailure.UNKNOWN)
             else:
                 if self._state.is_placeholder_pipeline:
                     logger.info("Placeholder pipeline started after source startup failure.")
@@ -703,6 +785,7 @@ class GstNativeSinkReceiver:
             logger.warning("set_source: prior pipeline did not reach NULL – aborting source change")
             return
         self._reset_video_flow_state()
+        self._state.forget_video_history()
 
         source_label = self._input.get_source_label(self._input_config)
         if self._has_configured_source():
@@ -719,7 +802,7 @@ class GstNativeSinkReceiver:
                 self.play()
             except Exception as e:
                 logger.warning("Failed to connect to source %s: %s", source_label, e)
-                self._schedule_reconnect(str(e))
+                self._schedule_reconnect(str(e), failure=VideoFailure.UNKNOWN)
         else:
             self.play()
 
@@ -790,12 +873,14 @@ class GstNativeSinkReceiver:
         if self._state.restore_connection_after_selection():
             self._status_marker.set_connected(source_label)
         elif source_label:
-            # No message: this is progress, not a failure. Passing one would
-            # store it as the error, and an input with ``max_attempts=1`` (NDI)
-            # falls back on the very next attempt and would publish
-            # "Reconnecting to previous source" as the terminal reason - saying
-            # it is still trying at the moment it gave up.
-            self._schedule_reconnect()
+            # No message and no verdict: this is progress, not a failure.
+            # A message would be stored as the error, and an input with
+            # ``max_attempts=1`` (NDI) falls back on the very next attempt and
+            # would publish "Reconnecting to previous source" as the terminal
+            # reason - saying it is still trying at the moment it gave up. A
+            # classification would be just as wrong: nothing has been tried yet,
+            # so there is nothing to diagnose.
+            self._schedule_reconnect(failure=VideoFailure.NONE)
         else:
             self._status_marker.set_disconnected("Source selection cancelled")
 
@@ -849,9 +934,9 @@ class GstNativeSinkReceiver:
     def _handle_bus_async_done(self, pipeline: Any) -> None:
         self._input.on_bus_async_done(pipeline)
 
-    def _handle_bus_error(self, error_message: str) -> None:
+    def _handle_bus_error(self, error: BusError) -> None:
         self._state.mark_disconnected()
-        self._schedule_reconnect(error_message)
+        self._schedule_reconnect(error.message, error)
 
     def _handle_bus_eos(self) -> None:
         # A looping input (Media Gallery clip) seeks back to start on EOS and
@@ -909,7 +994,30 @@ class GstNativeSinkReceiver:
 
     # -- Reconnection ---------------------------------------------------------
 
-    def _schedule_reconnect(self, error_message: str = "") -> None:
+    def _classify(self, error: BusError | None) -> VideoFailure:
+        """Name the current failure from how far this feed has ever got."""
+        return classify_failure(
+            phase=self._state.phase,
+            domain=error.domain if error else "",
+            code=error.code if error else 0,
+            message=error.message if error else "",
+            debug=error.debug if error else "",
+        )
+
+    def _schedule_reconnect(
+        self,
+        error_message: str = "",
+        error: BusError | None = None,
+        *,
+        failure: VideoFailure | None = None,
+    ) -> None:
+        # Classify first: ``_reset_video_flow_state`` below clears the phase and
+        # flow flag this reads. An explicit *failure* is for faults on this
+        # station, which never dialled anything and so cannot be classified from
+        # how far a connection got. The phase is captured here for the same
+        # reason, and published with the verdict it explains.
+        failure = self._classify(error) if failure is None else failure
+        phase = self._state.phase
         self._cancel_connection_timeout()
         self._cancel_reconnect()
         self._cancel_heal()
@@ -925,7 +1033,7 @@ class GstNativeSinkReceiver:
                 self._pipeline = None
 
         schedule = self._state.build_reconnect_schedule(self._reconnect_policy)
-        self._status_marker.set_reconnecting(schedule.attempt, error_message)
+        self._status_marker.set_reconnecting(schedule.attempt, error_message, failure=failure, phase=phase)
 
         max_attempts = self._reconnect_policy.max_attempts
         logger.info(
@@ -994,7 +1102,11 @@ class GstNativeSinkReceiver:
             # reports "Unauthorized (401)" on every attempt, and replacing that
             # with "No RTSP connection" discards the whole diagnosis for a
             # sentence that says no more than the Signal row already does.
-            reason = self._status_marker.error_message or f"No {self._input.display_name} connection"
+            # One generation: ``set_connected`` fires from a GStreamer streaming
+            # thread, so three property reads could compose the terminal state
+            # out of two different ones.
+            prior = self._status_marker.snapshot()
+            reason = prior.error_message or f"No {self._input.display_name} connection"
             if self._input_caps.has_source_selection:
                 # Clear primary config field for selection-based inputs.
                 if self._input.config_fields():
@@ -1003,7 +1115,10 @@ class GstNativeSinkReceiver:
                 self._state.activate_source_selection()
             else:
                 self._state.deactivate_source_selection()
-            self._status_marker.set_disconnected(reason)
+            # Carry the classification for the same reason ``reason`` is carried:
+            # giving up is not a new diagnosis, and this is the state the
+            # operator is left staring at.
+            self._status_marker.set_disconnected(reason, failure=prior.failure, phase=prior.phase)
 
             self._create_placeholder_pipeline()
             if self._input_caps.has_source_discovery:
@@ -1045,7 +1160,7 @@ class GstNativeSinkReceiver:
             # through to the max-attempts heal path).
             if self._state.is_placeholder_pipeline:
                 logger.warning("Pipeline build failed during reconnect – rescheduling")
-                self._schedule_reconnect("Pipeline build failed during reconnect")
+                self._schedule_reconnect("Pipeline build failed during reconnect", failure=VideoFailure.UNKNOWN)
                 return False
             widget = self.get_sink_widget()
             if self._on_widget_changed is not None and widget is not None:

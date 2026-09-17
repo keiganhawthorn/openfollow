@@ -51,3 +51,36 @@ def pretty_label(value: object) -> str:
         else:
             out.append(word[:1].upper() + word[1:].lower())
     return " ".join(out)
+
+
+def video_signal_label(connected: bool, failure: str) -> str:
+    """Label the Video panel's signal state by what went wrong.
+
+    An unrecognised token degrades to the plain state rather than raising: a
+    stats payload from a newer build must not take the panel down.
+    """
+    from openfollow.video.failure import VideoFailure, failure_chip
+
+    if connected:
+        return "Connected"
+    try:
+        classified = VideoFailure(failure)
+    except ValueError:
+        return "Disconnected"
+    if classified in (VideoFailure.NONE, VideoFailure.UNKNOWN):
+        return "Disconnected"
+    return failure_chip(classified)
+
+
+def video_error_token(failure_text: str, error_message: str, action: str) -> str:
+    """Identify the failure box by what it actually displays.
+
+    ``hx-preserve`` keys on this id. Hashing text the box hides (the pipeline's
+    own wording, shown only when there is no classification) re-inserts the node
+    on changes nobody sees, re-announcing the alert; omitting the action leaves
+    stale text when only the advice changes.
+    """
+    import hashlib
+
+    shown = (failure_text or error_message) + "\x00" + action
+    return hashlib.sha256(shown.encode("utf-8")).hexdigest()[:12]

@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from openfollow.video.connection_status import ConnectionStatus, NdiStatusMarker
+from openfollow.video.failure import ConnectionPhase, VideoFailure
 
 pytestmark = pytest.mark.unit
 
@@ -81,13 +82,13 @@ class TestNdiStatusMarker:
         marker.set_connecting("Cam")
         assert marker.error_message == ""
 
-    def test_connecting_after_disconnect_error_starts_clean(self) -> None:
-        """A disconnect error must NOT bleed into the next fresh connect – only
-        an active RECONNECTING episode keeps the pending error."""
+    def test_connecting_after_an_unclassified_disconnect_starts_clean(self) -> None:
+        """An unclassified disconnect is not a standing diagnosis, so it does
+        not bleed into the next connect."""
         marker = NdiStatusMarker()
         marker.set_disconnected("Signal lost")
         assert marker.error_message == "Signal lost"
-        marker.set_connecting("Cam")  # fresh connect (prior was DISCONNECTED)
+        marker.set_connecting("Cam")
         assert marker.status == ConnectionStatus.CONNECTING
         assert marker.error_message == ""
 
@@ -135,7 +136,7 @@ class TestNdiStatusMarker:
     def test_callback_fires_on_state_change(self) -> None:
         marker = NdiStatusMarker()
         events: list[tuple] = []
-        marker.add_callback(lambda s, n, a, e: events.append((s, n, a, e)))
+        marker.add_callback(lambda s, n, a, e, f: events.append((s, n, a, e)))
 
         marker.set_connecting("Cam")
         assert len(events) == 1
@@ -144,7 +145,7 @@ class TestNdiStatusMarker:
     def test_callback_does_not_fire_when_state_unchanged(self) -> None:
         marker = NdiStatusMarker()
         events: list[tuple] = []
-        marker.add_callback(lambda s, n, a, e: events.append((s, n, a, e)))
+        marker.add_callback(lambda s, n, a, e, f: events.append((s, n, a, e)))
 
         marker.set_disconnected("")  # already disconnected with empty error
         assert len(events) == 0
@@ -153,8 +154,8 @@ class TestNdiStatusMarker:
         marker = NdiStatusMarker()
         calls_a: list[ConnectionStatus] = []
         calls_b: list[ConnectionStatus] = []
-        marker.add_callback(lambda s, n, a, e: calls_a.append(s))
-        marker.add_callback(lambda s, n, a, e: calls_b.append(s))
+        marker.add_callback(lambda s, n, a, e, f: calls_a.append(s))
+        marker.add_callback(lambda s, n, a, e, f: calls_b.append(s))
 
         marker.set_connected("Cam")
         assert len(calls_a) == 1
@@ -163,7 +164,7 @@ class TestNdiStatusMarker:
     def test_remove_callback(self) -> None:
         marker = NdiStatusMarker()
         events: list[tuple] = []
-        cb = lambda s, n, a, e: events.append((s, n, a, e))  # noqa: E731
+        cb = lambda s, n, a, e, f: events.append((s, n, a, e))  # noqa: E731
         marker.add_callback(cb)
         marker.set_connecting("Cam")
         assert len(events) == 1
@@ -174,11 +175,11 @@ class TestNdiStatusMarker:
 
     def test_remove_nonexistent_callback_is_noop(self) -> None:
         marker = NdiStatusMarker()
-        marker.remove_callback(lambda s, n, a, e: None)  # should not raise
+        marker.remove_callback(lambda s, n, a, e, f: None)  # should not raise
 
     def test_callback_exception_does_not_propagate(self) -> None:
         marker = NdiStatusMarker()
-        marker.add_callback(lambda s, n, a, e: 1 / 0)
+        marker.add_callback(lambda s, n, a, e, f: 1 / 0)
         # Should not raise despite ZeroDivisionError in callback
         marker.set_connected("Cam")
         assert marker.is_connected is True
@@ -309,7 +310,7 @@ class TestNdiStatusMarker:
     def test_full_lifecycle(self) -> None:
         marker = NdiStatusMarker()
         events: list[ConnectionStatus] = []
-        marker.add_callback(lambda s, n, a, e: events.append(s))
+        marker.add_callback(lambda s, n, a, e, f: events.append(s))
 
         marker.set_connecting("Cam")
         marker.set_connected("Cam")
@@ -359,7 +360,7 @@ class TestErrorMessageRedaction:
     def test_the_redacted_message_is_what_reaches_callbacks_and_snapshot(self) -> None:
         marker = NdiStatusMarker()
         seen: list[str] = []
-        marker.add_callback(lambda _s, _n, _a, error: seen.append(error))
+        marker.add_callback(lambda _s, _n, _a, error, _f: seen.append(error))
         marker.set_reconnecting(1, self._GST_AUTH_ERROR)
         assert seen and "hunter2" not in seen[0]
         assert "hunter2" not in marker.snapshot().error_message
@@ -368,3 +369,106 @@ class TestErrorMessageRedaction:
         marker = NdiStatusMarker()
         marker.set_disconnected("Connection timed out")
         assert marker.error_message == "Connection timed out"
+
+
+class TestFailureClassificationIsCarried:
+    """The classification travels inside the snapshot, so it cannot be rendered
+    against a different generation's state."""
+
+    def test_a_failure_rides_in_the_same_snapshot_as_its_state(self) -> None:
+        marker = NdiStatusMarker()
+        marker.set_reconnecting(1, "boom", failure=VideoFailure.UNREACHABLE)
+        snap = marker.snapshot()
+        assert (snap.status, snap.failure) == (ConnectionStatus.RECONNECTING, VideoFailure.UNREACHABLE)
+
+    def test_a_real_connect_clears_it(self) -> None:
+        marker = NdiStatusMarker()
+        marker.set_disconnected("boom", failure=VideoFailure.REFUSED)
+        marker.set_connected("Cam")
+        assert marker.failure == VideoFailure.NONE
+
+    def test_it_survives_the_next_attempt_in_a_reconnect_episode(self) -> None:
+        """``set_connecting`` carries the pending error through each retry; the
+        classification must travel with it or the two disagree mid-episode."""
+        marker = NdiStatusMarker()
+        marker.set_reconnecting(1, "no route", failure=VideoFailure.UNREACHABLE)
+        marker.set_connecting("Cam")
+        assert marker.error_message == "no route"
+        assert marker.failure == VideoFailure.UNREACHABLE
+
+    def test_a_standing_verdict_outlives_the_heal_retry(self) -> None:
+        """An input that has given up retries on the heal timer every few
+        seconds. Clearing here blanked the failure on every polling surface for
+        the length of each attempt, flickering it off and back on."""
+        marker = NdiStatusMarker()
+        marker.set_disconnected("Signal lost", failure=VideoFailure.STALLED)
+        marker.set_connecting("Cam")
+        assert marker.failure == VideoFailure.STALLED
+        assert marker.error_message == "Signal lost"
+
+    def test_a_source_change_is_what_clears_it(self) -> None:
+        """Repointing the input publishes an unclassified disconnect, and that
+        is the point the old verdict stops being current."""
+        marker = NdiStatusMarker()
+        marker.set_disconnected("Signal lost", failure=VideoFailure.STALLED)
+        marker.set_disconnected()  # what swap_input / set_source publish
+        marker.set_connecting("Cam")
+        assert marker.failure == VideoFailure.NONE
+        assert marker.error_message == ""
+
+    def test_callbacks_receive_the_classification(self) -> None:
+        seen: list[VideoFailure] = []
+        marker = NdiStatusMarker()
+        marker.add_callback(lambda _s, _n, _a, _e, failure: seen.append(failure))
+        marker.set_disconnected("boom", failure=VideoFailure.UNAUTHORIZED)
+        assert seen == [VideoFailure.UNAUTHORIZED]
+
+    def test_a_changed_classification_alone_is_a_state_change(self) -> None:
+        """Same state and text, different verdict: readers must still hear it."""
+        events: list[VideoFailure] = []
+        marker = NdiStatusMarker()
+        marker.add_callback(lambda _s, _n, _a, _e, failure: events.append(failure))
+        marker.set_disconnected("timeout", failure=VideoFailure.UNREACHABLE)
+        marker.set_disconnected("timeout", failure=VideoFailure.NO_DATA)
+        assert events == [VideoFailure.UNREACHABLE, VideoFailure.NO_DATA]
+
+
+class TestThePhaseTravelsWithTheVerdict:
+    """``/api/stats`` publishes ``video.phase`` for support to read.
+
+    Read off live receiver state it was useless: the attempt is reset before
+    every retry, so on hardware every disconnected reading came back
+    ``starting`` - including a feed that had been decoding a second earlier.
+    """
+
+    def test_a_failure_keeps_the_phase_it_was_judged_at(self) -> None:
+        marker = NdiStatusMarker()
+        marker.set_reconnecting(1, "boom", failure=VideoFailure.STALLED, phase=ConnectionPhase.DECODING)
+        assert marker.snapshot().phase == ConnectionPhase.DECODING
+
+    def test_a_connected_feed_reports_decoding(self) -> None:
+        """Reaching DECODING is what made it connected."""
+        marker = NdiStatusMarker()
+        marker.set_connected("Cam")
+        assert marker.phase == ConnectionPhase.DECODING
+
+    def test_it_survives_the_retry_inside_a_reconnect_episode(self) -> None:
+        marker = NdiStatusMarker()
+        marker.set_reconnecting(1, "boom", failure=VideoFailure.STALLED, phase=ConnectionPhase.DECODING)
+        marker.set_connecting("Cam")
+        assert marker.phase == ConnectionPhase.DECODING
+
+    def test_a_source_change_starts_the_phase_from_nothing(self) -> None:
+        marker = NdiStatusMarker()
+        marker.set_disconnected("old", failure=VideoFailure.STALLED, phase=ConnectionPhase.DECODING)
+        marker.set_disconnected()  # what swap_input / set_source publish
+        marker.set_connecting("Cam")
+        assert marker.phase == ConnectionPhase.STARTING
+
+    def test_it_rides_in_the_same_snapshot_as_the_verdict(self) -> None:
+        """Published separately, a reader could pair one generation's phase
+        with another's failure - the mix ``snapshot()`` exists to prevent."""
+        marker = NdiStatusMarker()
+        marker.set_reconnecting(2, "x", failure=VideoFailure.NO_DATA, phase=ConnectionPhase.STREAM_DESCRIBED)
+        snap = marker.snapshot()
+        assert (snap.failure, snap.phase) == (VideoFailure.NO_DATA, ConnectionPhase.STREAM_DESCRIBED)

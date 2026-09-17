@@ -49,6 +49,7 @@ from openfollow.runtime.services_marker_visuals import (
 from openfollow.runtime_metrics import FrameMetrics, OverlayStatePool
 from openfollow.scene.camera import Camera
 from openfollow.system_stats import SystemStatsCollector
+from openfollow.video.failure import ConnectionPhase, VideoFailure, failure_action, failure_sentence
 from openfollow.video.overlay import CairoOverlayRenderer
 from openfollow.video.receiver import GstNativeSinkReceiver, gst_runtime_available
 from openfollow.window import GtkNativeSinkWindow
@@ -2707,6 +2708,10 @@ class AppRuntimeServices:
             "connected": False,
             "reconnect_attempt": 0,
             "error_message": "",
+            "failure": VideoFailure.NONE.value,
+            "failure_text": "",
+            "failure_action": "",
+            "phase": ConnectionPhase.STARTING.name.lower(),
             "resolution": {"width": 0, "height": 0},
             "source_selection_active": False,
             "source_fps": 0.0,
@@ -2719,6 +2724,22 @@ class AppRuntimeServices:
             # together to decide whether to raise the failure banner.
             status = receiver.status_marker.snapshot()
             width, height = receiver.resolution
+            # Only a classified failure gets a sentence. NONE's ("Video is
+            # arriving.") would otherwise be published beside ``connected:
+            # false`` during a connect attempt, and UNKNOWN's contradicts the
+            # element wording next to it - the same rule every renderer applies.
+            #
+            # The name comes from the snapshot, not the live receiver: falling
+            # back to the source picker clears the selection from the input's
+            # config, so a live read loses which source failed and the sentence
+            # degrades to "the video source". The snapshot kept the name it had
+            # when it connected. Already credential-free; this route is exempt
+            # from the web PIN.
+            failure_text = (
+                ""
+                if status.failure in (VideoFailure.NONE, VideoFailure.UNKNOWN)
+                else failure_sentence(status.failure, where=status.source_name, kind=receiver.source_kind)
+            )
             video_snapshot = {
                 "source_type": cfg.video_source_type,
                 "source_label": receiver.source_name,
@@ -2726,6 +2747,17 @@ class AppRuntimeServices:
                 "connected": bool(status.is_connected),
                 "reconnect_attempt": int(status.reconnect_attempt),
                 "error_message": status.error_message,
+                "failure": status.failure.value,
+                "failure_text": failure_text,
+                "failure_action": (
+                    ""
+                    if status.failure is VideoFailure.NONE
+                    else failure_action(status.failure, kind=receiver.source_kind)
+                ),
+                # The phase the verdict was formed at, not the in-flight one:
+                # the attempt is reset before each retry, so a live read
+                # reports every failure as a cold start.
+                "phase": status.phase.name.lower(),
                 "resolution": {"width": int(width), "height": int(height)},
                 "source_selection_active": bool(receiver.source_selection_active),
                 "source_fps": float(getattr(receiver, "source_framerate", 0.0)),

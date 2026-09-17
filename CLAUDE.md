@@ -271,6 +271,9 @@ Each plugin declares:
 - `web_ui_html()` → HTML fragment for the web settings form
 - `web_routes()` → additional HTTP endpoints (e.g. `/video-input/ndi/sources`)
 - `is_available()` → `(bool, reason)`; defaults to `(True, "")`. Override when the plugin needs an OS or GStreamer element that isn't universally present (e.g. `v4l2src` on Linux, `avfvideosrc` on macOS, the `ndisrc` plugin from gst-plugin-ndi).
+- `source_element_name` → the **instance name** of the element that first produces bytes from the source (`"rtspsrc"`, `"udpsrc"`, `"media_source"`, …), or `None` for an input with no such boundary. The receiver probes it for the first buffer → `DATA_ARRIVING`. `TestSourceElementDeclaration` in [`tests/test_video_input_plugins.py`](tests/test_video_input_plugins.py) builds each plugin's pipeline and asserts the name resolves, so a rename inside `create_pipeline` can't silently detach the probe
+- `source_kind` → `SourceKind.REMOTE` (dials a host: rtsp, srt), `NAMED` (finds a source by name: ndi), `LISTENER` (waits at an address: rtp) or `LOCAL` (hardware or a file on this box). It picks the **wording** of the sentence and the action, so an NDI source is not told to check an address and port it does not have, and a USB camera is not told to check a sender. Defaults to `LOCAL`, which names no address, port or sender - a plugin that forgets is vague, never wrong
+- `observe_progress(pipeline, report)` → optional; report protocol progress only that plugin can see. RTSP wires `rtspsrc::on-sdp` → `TRANSPORT_UP` + `STREAM_DESCRIBED`. The receiver keeps the furthest phase reported, so a duplicate or out-of-order report is harmless
 
 ### Receiver (`video/receiver.py`) – generic orchestrator
 Delegates protocol-specific work to the active plugin. Retains shared infrastructure:
@@ -279,6 +282,7 @@ Delegates protocol-specific work to the active plugin. Retains shared infrastruc
 - Shared gtksink management (detach/reattach across pipeline switches)
 - Connection timeout, reconnection scheduling (driven by plugin's `ReconnectPolicy`)
 - First-frame / caps detection via downstream pad probes (`_on_pad_event` for the caps event, `_on_sink_buffer` → `_handle_video_connected` on the first buffer) – replaces the old `cairooverlay` caps-changed signal
+- Source-byte observation: `_attach_source_probe()` puts a one-shot buffer probe on the plugin's `source_element_name`. Attached **per pipeline** (the source element is rebuilt on every reconnect), unlike the sink probes which attach once for the shared sink's lifetime. A source with no static `src` pad (`rtspsrc`) is followed via `pad-added`
 - Source discovery scheduling (calls plugin's `discover_sources()`)
 - Source selection state management (generic, checks `InputCapabilities.has_source_selection`)
 
@@ -306,6 +310,109 @@ srtsrc → pre_queue → decodebin → post_queue → videoconvert → shared_vi
 `rtsp_user` / `rtsp_password` / `srt_passphrase` are rendered as a login block under each plugin's URL (password inputs) and drive the element properties directly. The URL's own credential is **stripped before** `location` / `uri` is handed over – `rtspsrc` tries URL userinfo first and only then falls back to `user-id` / `user-pw`, so leaving it in would let a stale URL credential outrank the form. Blank fields leave the existing URL-userinfo path working untouched.
 
 `ConfigField(strip=False)` marks a credential so the web-save path keeps its edge whitespace, where every other string field is trimmed: the whitespace can be part of the secret and is invisible in a password field, so trimming it fails authentication with nothing on screen to explain why.
+
+### Video failure taxonomy (`video/failure.py`)
+
+Four outcomes that all presented as the same "no video received after 8s":
+**nothing ever answered**, **it answered but sent no media**, **media arrives
+but never decodes**, and **it was flowing and stopped**. Each sends the
+operator to different equipment.
+
+`ConnectionPhase` (`STARTING` → `TRANSPORT_UP` → `STREAM_DESCRIBED` →
+`DATA_ARRIVING` → `DECODING`) records how far an attempt got. `DATA_ARRIVING`
+is the load-bearing one (bytes out of the source element, which every protocol
+has), and `ReceiverStateMachine.note_phase` keeps the **furthest** reached
+because the probes fire from different threads and arrive out of order.
+
+`classify_failure(phase, domain, code, message, debug)` names the failure, and
+the phase is what decides an ambiguous error: the same
+`GstResourceError.OPEN_READ` is `UNREACHABLE` before any bytes arrive and
+`STALLED` after them. **`debug` is not optional detail** - the refusal marker
+and the empty-SDP marker both live in GStreamer's debug string, not its message,
+so a caller that drops it discards the evidence the mapping depends on. A known
+domain carrying a code with no rule (the generic `FAILED = 1`) stays `UNKNOWN`
+rather than landing in a neighbouring bucket.
+
+**Classify before `_reset_video_flow_state`.** `_schedule_reconnect` clears the
+phase it classifies from, so the verdict is computed at the top of that method;
+computing it afterwards reads every failure as a cold start.
+
+**`ReceiverStateMachine.phase` is the furthest the *feed* ever reached, not the
+attempt.** It survives `reset_video_flow` (which clears only per-attempt state
+like `video_flow_detected`) and is cleared solely by `forget_video_history` on a
+source change. A retry knows nothing, so classifying or publishing from a
+per-attempt phase redescribes every dropped feed as one that was never
+reachable - which is exactly what hardware showed, twice: first as a `STALLED`
+verdict overwritten by the next retry's `UNREACHABLE`, then as `stalled`
+published alongside `phase: starting`.
+
+There is deliberately **one** such concept. An earlier shape had a separate
+`had_video` latch beside a per-attempt phase, and the two disagreed on the
+device the moment a retry landed.
+
+**Only `DECODING` is evidence video arrived** - nothing but `mark_frame_received`
+sets it. `DATA_ARRIVING` is bytes out of the source element, which a feed
+carrying an undecodable payload produces just as readily, so it means "it
+answered", not "it worked". Because only RTSP reports `TRANSPORT_UP` /
+`STREAM_DESCRIBED`, `DATA_ARRIVING` is also the only route to `NO_DATA` for
+every other input.
+Hardware found this: a camera pulled mid-stream was classified `STALLED`
+correctly and then reclassified `UNREACHABLE` by the very next retry, telling
+the operator nothing answered about a camera that had been on screen a second
+earlier.
+
+One module owns the enum and both text maps so the five surfaces that render
+them cannot drift. `VideoFailure` values are a **wire interface** –
+`/api/stats` publishes `video.failure` for support tooling, so renaming a
+member breaks a consumer's matching.
+
+Sentences state **only what this station observed**, never what the far end
+did. "answered, but sent no video" asserted the camera sent nothing when it may
+have been sending into a blocked path; a stall is "stopped arriving", not
+"stopped sending". Sentences otherwise **describe the observation and stop**,
+and `failure_action` carries
+**one short next step** beside them - two fields, never blurred into one, so a
+reader quoting the observation into a support thread does not carry our advice
+with it. Anything longer than a line belongs in the website docs, which an
+operator on a stage cannot open. The pipeline's own wording ("Could not open
+resource for reading and writing.") is **not** shown to an operator: it reads as
+a second, unrelated fault and nothing can be done with it. It stays in
+`/api/stats` and the diagnostics bundle, and stands in for the sentence only
+where there is no classification at all. `where` must already be redacted – it reaches the HUD and the PIN-exempt
+`/section/statistics`. `UNKNOWN` renders **no** sentence on any surface: it
+would sit above the element's own wording and contradict it.
+
+**The phase is published inside `_StatusSnapshot`, with the verdict it
+explains.** Publishing it separately from `failure` would let a reader pair one
+generation's phase with another's verdict.
+
+**Surfaces:** the top-right status badge carries the *chip* only
+(`_status_flags["video_failure"]`, ~40 characters per row). The Settings error
+box and both web boxes carry the **sentence plus the action**, and never the
+element's own wording - every renderer uses `failure_text or error_message`, so
+the raw text appears only when there is no classification to replace it. It
+stays in `/api/stats` and the diagnostics bundle, which is what support reads
+against.
+
+**GStreamer does not report everything the taxonomy can express.** Verified on
+the bench against 1.26: a bad RTSP path comes back as
+`gst-resource-error-quark:13` with `SDP contains no streams`, not
+`RESOURCE_NOT_FOUND`. Check what the element actually emits before adding a
+mapping - a code that looks obvious from the enum may never be sent.
+
+**`REFUSED` has no observed producer.** `rtspsrc` reports a refused connection
+as `Failed to connect. (Generic error)`, the errno discarded inside GStreamer's
+RTSP stack; `srtsrc` posts **nothing at all**, because `auto-reconnect` defaults
+true and it retries internally until our own watchdog gives up first. The
+remaining inputs are a listener, a discovery-by-name protocol and local devices,
+none of which can be refused. Aligning the per-protocol timeouts (and
+`srt auto-reconnect=false`) is the change that would decide whether it can ever
+fire; until then the member ships unreachable and its text match is dead.
+
+**SRT currently cannot report why it failed.** `auto-reconnect` swallows every
+connect failure, so a wrong host, a closed port and a wrong passphrase all reach
+the operator as the same connection timeout. No amount of classification fixes
+that from this side of the element.
 
 ### Placeholder pipeline vs source state
 The "No Signal" placeholder is a black `videotestsrc` pinned at 1920x1080 @ 30 that feeds the **shared** sink, and both sink probes are attached once for that sink's lifetime – so its caps reach the same writer the real source uses. `ReceiverStateMachine.set_resolution` / `set_source_framerate` therefore refuse while `is_placeholder_pipeline`, mirroring `mark_frame_received`, and `_create_placeholder_pipeline` calls `clear_source_caps()` rather than writing its own geometry in. **Do not publish placeholder caps as source state**: `video.resolution` / `source_fps` are what the Statistics panel reports as the feed's own, and what `update_video` shapes the window from – a source that has never delivered a frame would otherwise present as a working 1080p feed and pin the window to 16:9 for the session.

@@ -97,6 +97,7 @@ from openfollow.templates.writer import (
 from openfollow.units import UnitSystem, parse_length, parse_speed
 from openfollow.web import diagnostics, peer_auth
 from openfollow.web._md import render_help_markdown
+from openfollow.web.labels import video_error_token
 from openfollow.web.login_throttle import LoginThrottle
 
 logger = logging.getLogger(__name__)
@@ -800,13 +801,17 @@ def _run_package_command(
     return rc, "\n".join(tail)
 
 
-def _build_input_template_data(cfg: AppConfig) -> dict[str, Any]:
+def _build_input_template_data(cfg: AppConfig, video_stats: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Build template variables for plugin-driven video source UI.
 
     Hides plugins whose ``is_available()`` returns False so picker dropdowns
     only show inputs that can actually run on the current host (e.g. the V4L2
     "USB Camera" plugin is hidden on macOS, where AVFoundation is offered
     instead).
+
+    Every render of the Video Source partial goes through here, so the live
+    failure travels with it rather than depending on each call site to
+    remember. ``video_stats`` is ``/api/stats``'s ``video`` section.
     """
     from openfollow.video.inputs import get_available_registry
 
@@ -816,9 +821,14 @@ def _build_input_template_data(cfg: AppConfig) -> dict[str, Any]:
     for iid, cls in sorted(registry.items()):
         values = cls.get_config_field_values(cfg)
         input_html_fragments[iid] = cls.web_ui_html(values)
+    video = dict(video_stats or {})
     return {
         "available_inputs": available_inputs,
         "input_html_fragments": input_html_fragments,
+        "video_failure": video.get("failure") or "none",
+        "video_failure_text": video.get("failure_text") or "",
+        "video_error_message": video.get("error_message") or "",
+        "video_failure_action": video.get("failure_action") or "",
     }
 
 
@@ -4116,12 +4126,19 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
         *,
         saved: bool = False,
     ) -> Any:
-        """Render the Video Source section."""
+        """Render the Video Source section.
+
+        The save response carries no failure: the swap is asynchronous, so the
+        live verdict at this instant still describes the source the operator
+        just replaced. The section does not poll, so naming the old URL would
+        leave it on screen until a page reload - reading as if the fix failed.
+        """
+        video = None if saved else server.get_runtime_stats().get("video")
         data: dict[str, Any] = {
             "config": cfg,
             "saved": saved,
         }
-        data.update(_build_input_template_data(cfg))
+        data.update(_build_input_template_data(cfg, video))
         return template("partials/video_source", **data)
 
     def _load_config_for_edit() -> AppConfig:
@@ -4347,7 +4364,7 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
             on_device=_is_on_device_request(),
             cancel_button=_cancel_button_label(config),
             psn_source_advisory=server.get_psn_source_advisory(),
-            **_build_input_template_data(config),
+            **_build_input_template_data(config, server.get_runtime_stats().get("video")),
         )
 
     @app.get("/section/overview")
@@ -4372,6 +4389,35 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
     def get_statistics() -> Any:
         """Get the live runtime statistics partial."""
         return template("partials/statistics", stats=server.get_runtime_stats())
+
+    @app.get("/section/video_source/failure")
+    def get_video_source_failure() -> Any:
+        """Just the video failure box, for the Camera & Grid tab to poll.
+
+        Only the box: re-swapping the Video Source form would discard whatever
+        the operator is part-way through typing into the URL or password
+        fields, which is precisely what they are there to do when it fails.
+        """
+        video = server.get_runtime_stats().get("video") or {}
+        failure_text = str(video.get("failure_text") or "")
+        error_message = str(video.get("error_message") or "")
+        # Keyed on what there is to show, not on whether a classification
+        # exists: several receiver paths publish an error with no verdict, and
+        # Statistics renders that raw text. Dropping it here would leave this
+        # box empty while the other said something.
+        if not (failure_text or error_message):
+            return ""
+        action = str(video.get("failure_action") or "")
+        token = video_error_token(failure_text, error_message, action)
+        return template(
+            "partials/video_error_box",
+            failure_text=failure_text,
+            error_message=error_message,
+            action=action,
+            token=token,
+            scope="source",
+            assertive=False,
+        )
 
     @app.get("/section/general/network_state")
     def get_general_network_state() -> Any:
@@ -4834,7 +4880,7 @@ def setup_routes(app: Bottle, server: ConfigWebServer) -> None:
             extra["local_ips"] = _get_local_ips()
             extra["psn_source_advisory"] = server.get_psn_source_advisory()
         elif name == "video_source":
-            extra.update(_build_input_template_data(config))
+            extra.update(_build_input_template_data(config, server.get_runtime_stats().get("video")))
         elif name in ("controller", "gamepad"):
             extra["button_names"] = sorted(VALID_BUTTON_NAMES)
             extra["detection_started"] = server.is_button_detection_active()

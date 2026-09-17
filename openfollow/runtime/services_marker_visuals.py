@@ -25,6 +25,14 @@ from openfollow.runtime.services_detection_pin import is_assist_controlled
 from openfollow.runtime.state_maps import get_or_create, prune_to_keep
 from openfollow.runtime_metrics import OverlayStatePool
 from openfollow.units import UnitSystem
+from openfollow.video.failure import SourceKind, VideoFailure, failure_action, failure_chip, failure_sentence
+
+
+def _receiver_kind(video_receiver: Any) -> SourceKind:
+    """The active input's source kind, tolerant of a boot-window receiver."""
+    kind = getattr(video_receiver, "source_kind", None)
+    return kind if isinstance(kind, SourceKind) else SourceKind.REMOTE
+
 
 # Same pattern ``GridConfig.__post_init__`` enforces. Duplicated here rather
 # than imported from configuration.py so this module doesn't reach into the
@@ -424,7 +432,7 @@ def build_marker_visual_state(
 
     video_receiver = app._video_receiver
     status_marker = video_receiver.status_marker
-    # Read the four status fields as one consistent unit – separate property
+    # Read the status fields as one consistent unit – separate property
     # reads could each catch a different _update generation and render a mixed
     # HUD line (e.g. connected=True with a stale reconnect error).
     status = status_marker.snapshot()
@@ -433,6 +441,25 @@ def build_marker_visual_state(
     state.source_label = video_receiver.source_name
     state.reconnect_attempt = status.reconnect_attempt
     state.error_message = status.error_message
+    # UNKNOWN contributes no sentence anywhere: it would sit beside the
+    # element's own wording and contradict it.
+    state.video_failure_action = (
+        ""
+        if status.failure is VideoFailure.NONE
+        else failure_action(status.failure, kind=_receiver_kind(video_receiver))
+    )
+    state.video_failure_text = (
+        ""
+        if status.failure in (VideoFailure.NONE, VideoFailure.UNKNOWN)
+        else failure_sentence(
+            # The snapshot's name, not the live one: falling back to the source
+            # picker clears the selection, and a live read would degrade the
+            # sentence to "the video source" at the moment it matters most.
+            status.failure,
+            where=status.source_name,
+            kind=_receiver_kind(video_receiver),
+        )
+    )
     state.source_selection_active = video_receiver.source_selection_active
     state.discovered_sources = video_receiver.discovered_sources
     state.selected_source_index = video_receiver.selected_source_index
@@ -759,6 +786,15 @@ def build_marker_visual_state(
     # fader-bus path: boot / mid-restart windows have no flags dict yet,
     # which we surface as "no warnings" rather than crashing the overlay.
     flags_dict = getattr(runtime_services, "_status_flags", None) if runtime_services is not None else None
+    if flags_dict is not None:
+        # The chip alone: a badge row holds ~40 characters, and the sentence
+        # plus the element's wording are already on the Settings box and the
+        # web UI. NOT_CONFIGURED is a setup state, not a fault to alarm on.
+        flags_dict["video_failure"] = (
+            ("error", f"Video: {failure_chip(status.failure)}")
+            if status.failure not in (VideoFailure.NONE, VideoFailure.NOT_CONFIGURED)
+            else None
+        )
     if flags_dict:
         # ``dict`` insertion order preserves the order subsystems
         # registered their slots; surface flags in that order so

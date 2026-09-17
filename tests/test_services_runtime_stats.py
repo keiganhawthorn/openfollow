@@ -26,6 +26,7 @@ import pytest
 import openfollow.services as services_module
 from openfollow.configuration import AppConfig
 from openfollow.services import AppRuntimeServices
+from openfollow.video.failure import ConnectionPhase, SourceKind, VideoFailure
 
 pytestmark = pytest.mark.unit
 
@@ -74,7 +75,7 @@ class _FakeOverlayRenderer:
 class _FakeStatusMarker:
     """Models the real marker, including that readers take one snapshot.
 
-    ``NdiStatusMarker`` publishes its four fields as an immutable unit and
+    ``NdiStatusMarker`` publishes its fields as an immutable unit and
     requires multi-field readers to go through ``snapshot()``; a fake that also
     answered bare property reads would let that contract be broken silently.
     """
@@ -83,6 +84,9 @@ class _FakeStatusMarker:
     is_connected: bool = True
     reconnect_attempt: int = 2
     error_message: str = "prev reset"
+    failure: VideoFailure = VideoFailure.UNAUTHORIZED
+    phase: ConnectionPhase = ConnectionPhase.DECODING
+    source_name: str = "CAM1"
 
     def snapshot(self) -> _FakeStatusMarker:
         return self
@@ -95,6 +99,7 @@ class _FakeReceiver:
         self.source_name = "CAM1"
         self.source_selection_active = False
         self.source_framerate = 59.94
+        self.source_kind = SourceKind.REMOTE
 
 
 class _FakeDetector:
@@ -337,6 +342,12 @@ class TestPublishRuntimeStats:
         assert video["connected"] is True
         assert video["resolution"] == {"width": 1920, "height": 1080}
         assert video["source_fps"] == pytest.approx(59.94)
+        # Machine-readable for support tooling, plus the sentence the panel and
+        # the HUD both render, so the two cannot describe the same failure
+        # differently.
+        assert video["failure"] == "unauthorized"
+        assert video["failure_text"] == "CAM1 rejected the login."
+        assert video["phase"] == "decoding"
 
     def test_receiver_absent_uses_default_video_shape(
         self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
@@ -351,6 +362,11 @@ class TestPublishRuntimeStats:
         assert video["pipeline_state"] == "disconnected"
         assert video["connected"] is False
         assert video["resolution"] == {"width": 0, "height": 0}
+        # Same keys either way: a consumer must not have to branch on whether a
+        # receiver happened to exist when the snapshot was taken.
+        assert video["failure"] == "none"
+        assert video["failure_text"] == ""
+        assert video["phase"] == "starting"
 
     def test_controller_counts_aggregate_mapped_vs_connected(
         self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
@@ -647,12 +663,16 @@ class _TearingStatusMarker:
             is_connected=True,
             reconnect_attempt=0,
             error_message="",
+            failure=VideoFailure.NONE,
+            phase=ConnectionPhase.DECODING,
         ),
         SimpleNamespace(
             status=SimpleNamespace(name="DISCONNECTED"),
             is_connected=False,
             reconnect_attempt=3,
             error_message="Unauthorized",
+            failure=VideoFailure.UNAUTHORIZED,
+            phase=ConnectionPhase.STREAM_DESCRIBED,
         ),
     )
 
@@ -819,3 +839,68 @@ class TestDeviceFigures:
         self._prime(services, hud_fps=59.75, canvas=_WrongShapeCanvas())
         snap = self._publish(services, monkeypatch)
         assert snap["system"]["output_resolution"] is None
+
+
+class TestTheSentenceNeverContradictsTheState:
+    """``failure_text`` is published for support tooling to read literally."""
+
+    def _video(self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch, failure: VideoFailure) -> dict:
+        receiver = _FakeReceiver()
+        receiver.status_marker.failure = failure
+        receiver.status_marker.is_connected = failure is VideoFailure.NONE
+        TestPublishRuntimeStats._prime(self, services, receiver=receiver)
+        import openfollow.video.detection as det
+
+        monkeypatch.setattr(det, "check_detection_dependencies", lambda cfg: [])
+        services.publish_runtime_stats(force=True)
+        return services.get_runtime_stats_snapshot()["video"]
+
+    def test_a_connect_attempt_does_not_claim_video_is_arriving(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Seen live: mid-swap the marker reads NONE while the feed is down,
+        and the payload asserted "Video is arriving." beside connected=false."""
+        video = self._video(services, monkeypatch, VideoFailure.NONE)
+        assert video["failure_text"] == ""
+
+    def test_an_unreadable_failure_publishes_no_sentence(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = self._video(services, monkeypatch, VideoFailure.UNKNOWN)
+        assert video["failure_text"] == ""
+        assert video["failure"] == "unknown"
+
+    def test_a_classified_failure_still_publishes_one(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = self._video(services, monkeypatch, VideoFailure.UNREACHABLE)
+        assert video["failure_text"] == "Nothing answered at CAM1."
+
+
+class TestTheSentenceNamesTheSourceThatFailed:
+    """Seen on a real NDI camera: the box read "Video from the video source
+    stopped arriving" about a named source that had been on screen.
+
+    Falling back to the picker clears the selection from the input's config, so
+    a live read loses the name at the moment it matters most. The snapshot kept
+    what it had when it connected.
+    """
+
+    def test_it_uses_the_name_the_verdict_was_published_with(
+        self, services: AppRuntimeServices, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receiver = _FakeReceiver()
+        receiver.status_marker.failure = VideoFailure.STALLED
+        receiver.status_marker.is_connected = False
+        receiver.status_marker.source_name = "AIDA NDI POV (HX-Stream)"
+        receiver.source_name = ""  # what the picker fallback leaves behind
+        TestPublishRuntimeStats._prime(self, services, receiver=receiver)
+        import openfollow.video.detection as det
+
+        monkeypatch.setattr(det, "check_detection_dependencies", lambda cfg: [])
+
+        services.publish_runtime_stats(force=True)
+        video = services.get_runtime_stats_snapshot()["video"]
+
+        assert "AIDA NDI POV (HX-Stream)" in video["failure_text"]
+        assert "the video source" not in video["failure_text"]

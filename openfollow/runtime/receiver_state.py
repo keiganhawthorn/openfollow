@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
+from openfollow.video.failure import ConnectionPhase
 from openfollow.video.inputs._base import ReconnectPolicy
 
 
@@ -29,6 +31,15 @@ class ReceiverStateMachine:
 
         self.connected = False
         self.video_flow_detected = False
+        # The furthest this *feed* has ever reached, not this attempt. Survives
+        # reconnects so a feed that dropped is not re-diagnosed as one that was
+        # never there; only a source change clears it.
+        self.phase = ConnectionPhase.STARTING
+        # Guards the read-modify-write in ``note_phase`` against the streaming
+        # threads the probes run on. Uncontended in the steady state: once the
+        # feed reaches DECODING every later call compares equal and writes
+        # nothing.
+        self._phase_lock = threading.Lock()
         self.resolution: tuple[int, int] = (0, 0)
         self.source_framerate: float = 0.0
         self.is_placeholder_pipeline = False
@@ -36,9 +47,37 @@ class ReceiverStateMachine:
         self.was_connected_before_selection = False
 
     def reset_video_flow(self) -> None:
+        """Start a fresh connection attempt.
+
+        ``phase`` deliberately survives: it describes the *feed*, not the
+        attempt, so a retry that fails is still reported by how far the feed
+        got rather than as a source that was never reachable.
+        """
         self.connected = False
         self.video_flow_detected = False
         self.clear_source_caps()
+
+    def forget_video_history(self) -> None:
+        """Drop how far the old feed got, because the source changed.
+
+        Nothing about the old source's history describes the new one.
+        """
+        with self._phase_lock:
+            self.phase = ConnectionPhase.STARTING
+
+    def note_phase(self, phase: ConnectionPhase) -> None:
+        """Record that the feed reached *phase*, keeping the furthest.
+
+        Probes fire from separate streaming threads and arrive out of order; a
+        lesser late observation must not walk a live feed back to a
+        reachability failure. The compare-and-assign is locked because that is
+        precisely what it would do if two probes interleaved: a thread reading
+        the old value, pausing while a higher phase is stored, then overwriting
+        it.
+        """
+        with self._phase_lock:
+            if phase > self.phase:
+                self.phase = phase
 
     def clear_source_caps(self) -> None:
         """Forget the negotiated resolution / frame rate of the last source."""
@@ -85,6 +124,7 @@ class ReceiverStateMachine:
         if self.is_placeholder_pipeline:
             return False
         self.video_flow_detected = True
+        self.note_phase(ConnectionPhase.DECODING)
         if not self.connected:
             self.connected = True
             return True

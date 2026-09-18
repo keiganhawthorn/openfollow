@@ -299,7 +299,7 @@ ndisrc → ndisrcdemux → ndi_video_queue (leaky) → videoconvert → shared_v
 ```
 srtsrc → pre_queue → decodebin → post_queue → videoconvert → shared_videosink
 ```
-- `srtsrc`: `mode=caller`, `wait-for-connection=True`, `latency=125ms`
+- `srtsrc`: `mode=caller`, `wait-for-connection=True`, `latency=125ms`, **`auto-reconnect=False`** (left on, it retries internally and the failure never reaches the bus)
 - `srt_passphrase`, when set, drives the `passphrase` property and the URL's own `?passphrase=` is stripped first, so one field answers "which key is this stream encrypted with". Blank leaves the URL path untouched
 - Hardware decoder priority boosting (V4L2 > avdec > openh264)
 - Preserves decoder latency on ASYNC_DONE (do NOT force 0)
@@ -402,17 +402,37 @@ mapping - a code that looks obvious from the enum may never be sent.
 
 **`REFUSED` has no observed producer.** `rtspsrc` reports a refused connection
 as `Failed to connect. (Generic error)`, the errno discarded inside GStreamer's
-RTSP stack; `srtsrc` posts **nothing at all**, because `auto-reconnect` defaults
-true and it retries internally until our own watchdog gives up first. The
-remaining inputs are a listener, a discovery-by-name protocol and local devices,
-none of which can be refused. Aligning the per-protocol timeouts (and
-`srt auto-reconnect=false`) is the change that would decide whether it can ever
-fire; until then the member ships unreachable and its text match is dead.
+RTSP stack, confirmed against a socket probe raising `ECONNREFUSED` for the same
+endpoint. `srtsrc` posts a real error once internal retry is off (below), but
+reports every cause identically. The remaining inputs are a listener, a
+discovery-by-name protocol and local devices, none of which can be refused. The
+member ships unreachable and its text match is dead.
 
-**SRT currently cannot report why it failed.** `auto-reconnect` swallows every
-connect failure, so a wrong host, a closed port and a wrong passphrase all reach
-the operator as the same connection timeout. No amount of classification fixes
-that from this side of the element.
+**The element must give up before our watchdog does**, or the pipeline is torn
+down before it can say why and the failure is classified from the phase alone.
+The defaults do not: `rtspsrc.tcp-timeout` is 20 s and `srtsrc.auto-reconnect`
+retries forever. **The budget each is measured against is per plugin**, not one
+number - RTSP allows 15 s and sets `tcp-timeout` to 10 s inside it; SRT allows
+8 s and turns internal retry off, which is what puts an error on the bus at
+all. **`rtspsrc.timeout` is deliberately left alone**: it is the live
+UDP-to-TCP fallback trigger, armed for the whole session, so lowering it
+downgrades a working feed to TCP-interleaved on any brief gap. `tcp-timeout` is
+likewise not the connect deadline but the wait for each RTSP response, so it
+stays generous enough for a busy NVR to answer DESCRIBE. **`udpsrc.timeout` is
+left alone too**: the stall watchdog already covers socket silence and honours
+the operator's `stall_timeout` including its `0 = off`, and a second reporter at
+the same window only races it for the message. Read what a property does before
+setting it - two of these three were misread first time.
+`TestTheElementGivesUpFirst` keys on `source_element_name` and `SourceKind`, so
+a networked plugin absent from its map fails rather than passing silently.
+
+**SRT reports *that* it failed, never *why*.** With `auto-reconnect` off a real
+error reaches the bus in ~3 s instead of nothing at all, but an unresponsive
+listener, a wrong passphrase, a closed port and an unroutable host are all
+`gst-resource-error-quark:9` with `Connection timeout (16)`. That is libsrt's
+design at the caller - telling one from another for the passphrase case would be
+an oracle - not a gap in the taxonomy. Do not add a mapping that pretends
+otherwise.
 
 ### Placeholder pipeline vs source state
 The "No Signal" placeholder is a black `videotestsrc` pinned at 1920x1080 @ 30 that feeds the **shared** sink, and both sink probes are attached once for that sink's lifetime – so its caps reach the same writer the real source uses. `ReceiverStateMachine.set_resolution` / `set_source_framerate` therefore refuse while `is_placeholder_pipeline`, mirroring `mark_frame_received`, and `_create_placeholder_pipeline` calls `clear_source_caps()` rather than writing its own geometry in. **Do not publish placeholder caps as source state**: `video.resolution` / `source_fps` are what the Statistics panel reports as the feed's own, and what `update_video` shapes the window from – a source that has never delivered a frame would otherwise present as a working 1080p feed and pin the window to 16:9 for the session.

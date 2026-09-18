@@ -22,6 +22,10 @@ from openfollow.video.inputs._base import (
 
 logger = logging.getLogger(__name__)
 
+# Microseconds. Bounds the wait for each RTSP response, not the TCP connect, so
+# it stays generous enough for a busy NVR to answer DESCRIBE.
+_TCP_TIMEOUT_US = 10_000_000
+
 
 def _endpoint_from_url(
     url: str, *, scheme: str, default_port: int, connection_oriented: bool = True
@@ -91,7 +95,8 @@ class RtspInput(VideoInputBase):
             min_delay=0.5,
             max_delay=3.0,
             backoff_multiplier=1.5,
-            connection_timeout=8.0,
+            # Outlasts _TCP_TIMEOUT_US so the element reports first.
+            connection_timeout=15.0,
             fallback_to_selection=True,
             heal_interval=5.0,
             stall_timeout=3.0,
@@ -161,6 +166,9 @@ class RtspInput(VideoInputBase):
         if user or password:
             rtspsrc.set_property("user-id", user)
             rtspsrc.set_property("user-pw", password)
+        # Must expire before our connection timeout, or we tear the pipeline
+        # down before the element can say why it failed.
+        rtspsrc.set_property("tcp-timeout", _TCP_TIMEOUT_US)
         rtspsrc.set_property("latency", 0)
         rtspsrc.set_property("drop-on-latency", True)
         rtspsrc.set_property("buffer-mode", 0)  # none – lowest latency

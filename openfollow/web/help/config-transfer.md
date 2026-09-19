@@ -1,6 +1,6 @@
-# Configuration Transfer
+# Configuration
 
-Back up and restore a station's full settings as a single `.openfollowsettings` file – duplicate a config across stations, archive a rig before changes, or recover from a snapshot.
+Move a station's full settings in and out as a single `.openfollowsettings` file – duplicate a config across stations, archive a rig before changes, or recover from a snapshot – and put every setting back to its default.
 
 **Export Configuration** – downloads the current configuration as a `.openfollowsettings` file containing every saved setting (camera, grid, markers, zones, OSC, MIDI, input, display).
 
@@ -13,3 +13,5 @@ The restart dialogue offers three choices:
 - **Restart Now** – apply everything and restart; the page reloads once the station is back online.
 - **Apply Without Restart** – apply what can take effect immediately; the rest waits for the next restart.
 - **Cancel** – discard the import; nothing changes.
+
+**Restore Defaults** – returns every setting to the value a fresh install has: camera, grid, markers, zones, OSC, MIDI, input, display and video source. A confirmation dialogue appears first, and there is no undo. The station restarts to finish the reset – a few settings only take effect at startup – and the page returns on its own once it is back. What stays is what describes this box rather than the show: the web login PIN, port and interface – network access is not reset, so this page keeps working – the station's identity (its name follows that identity, as it did on the first run), and local file paths such as the detection model storage. Marker definitions in the shared catalog and uploaded media are not settings, so they are untouched.

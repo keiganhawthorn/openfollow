@@ -4,12 +4,16 @@
 # lint / typecheck / security / test / build steps plus coverage and mutation.
 
 .PHONY: ci ci-remote lint format typecheck security audit test test-unit test-integration test-smoke-e2e build dmg coverage coverage-html coverage-xml install-hooks \
-        mutation mutation-results mutation-show mutation-clean
+        mutation mutation-module mutation-results mutation-show mutation-clean
 
 # Combined line + branch coverage floor – ratchet up with every PR.
 # Path to 100% is the gate; CI invokes test-integration so the
 # value never drifts between local `make test` and CI.
 COVERAGE_MIN ?= 100
+
+# The test file ``[tool.mutmut]`` runs each mutant against; echoed by
+# ``mutation-module`` so the scope of a run is visible in its own output.
+MUTATION_TESTS := $(shell poetry run python -c "import tomllib,pathlib; print(' '.join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['mutmut']['pytest_add_cli_args_test_selection']))" 2>/dev/null)
 
 # Match the workflow's Hypothesis profile (.github/workflows/ci.yml). Without
 # this the pre-push gate fuzzes randomized while CI is derandomized, so a
@@ -158,6 +162,22 @@ mutation-clean:
 
 mutation: mutation-clean
 	poetry run mutmut run
+
+# Mutate one module by mutant-name pattern, which mutmut derives from the dotted
+# module path:
+#   make mutation-module MODULE=openfollow.zones.engine
+#
+# This selects which mutants run, NOT which tests they run against. Pointing it
+# at a module whose tests are not in ``pytest_add_cli_args_test_selection``
+# reports every mutant as survived - for want of a test, not for want of an
+# assertion - which reads like a damning result and means nothing. mutmut takes
+# no command-line override for that, so a different module still needs both it
+# and ``do_not_mutate`` edited in pyproject.toml first. The default example is
+# the one the committed config already covers.
+mutation-module:
+	@test -n "$(MODULE)" || { echo "usage: make mutation-module MODULE=openfollow.<module>"; exit 2; }
+	@echo "note: mutants run against $(MUTATION_TESTS) - a module outside that reports every mutant survived"
+	poetry run mutmut run "$(MODULE).*"
 
 mutation-results:
 	poetry run mutmut results

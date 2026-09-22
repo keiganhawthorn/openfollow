@@ -267,15 +267,8 @@ class GamepadHandler:
         # which OpenFollow doesn't use. On Linux, SDL audio opens the default ALSA
         # device and floods the log. Point SDL audio at the dummy driver before init.
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-        # OpenFollow never draws through SDL's window (GTK owns the real one on
-        # every platform); the video subsystem is only a hard dependency of
-        # joystick init. Left on its real backend, SDL ties pygame.event.get()
-        # (called every animate() tick) to the same OS main-loop primitives GTK
-        # is separately driving for the video window - on macOS this is the
-        # Cocoa run loop, and the two competing for it produced multi-second
-        # per-tick stalls in `GamepadHandler.update` that got worse under
-        # system load, freezing markers/PSN/OTP/RTTrPM/OSC for the duration.
-        # The dummy driver's event pump is a true no-op.
+        # The video subsystem is what pygame's event API needs, not joystick
+        # init, and SDL's real backend pumps the same run loop GTK drives.
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         if not pygame.get_init():
             pygame.init()
